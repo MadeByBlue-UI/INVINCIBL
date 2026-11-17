@@ -322,6 +322,11 @@ local Templates = {
     ScrollingFrame = {
         BorderSizePixel = 0,
     },
+    CanvasGroup = {
+        BackgroundColor3 = "BackgroundColor",
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    },
     TextLabel = {
         BorderSizePixel = 0,
         FontFace = "Font",
@@ -2130,14 +2135,40 @@ function Library:PlayTabAnimation(TabCanvas: CanvasGroup, Showing: boolean, OnCo
             end
         end)
     else
-        TabCanvas.GroupTransparency = 1
-        TabCanvas.Visible = false
-        TabCanvas.Position = UDim2.fromScale(0, 0)
-        TabCanvas.ZIndex = BaseZIndex
+        local TweenInfo = Library.TabTransitionInfo or TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
-        if OnComplete then
-            OnComplete()
-        end
+        TabCanvas.ZIndex = BaseZIndex
+        TabCanvas.Position = UDim2.fromScale(0, 0)
+
+        local Tween = TweenService:Create(TabCanvas, TweenInfo, {
+            GroupTransparency = 1
+        })
+
+        ActiveTabTweens[TabCanvas] = Tween
+        Tween:Play()
+
+        local Connection; Connection = Tween.Completed:Connect(function(PlaybackState)
+            if Connection then
+                Connection:Disconnect()
+            end
+
+            if ActiveTabTweens[TabCanvas] == Tween then
+                ActiveTabTweens[TabCanvas] = nil
+            end
+
+            if PlaybackState == Enum.PlaybackState.Cancelled then
+                return
+            end
+
+            TabCanvas.Visible = false
+            TabCanvas.GroupTransparency = 1
+            TabCanvas.Position = UDim2.fromScale(0, 0)
+            TabCanvas.ZIndex = BaseZIndex
+
+            if OnComplete then
+                OnComplete()
+            end
+        end)
     end
 end
 
