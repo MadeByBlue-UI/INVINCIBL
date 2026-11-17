@@ -2054,16 +2054,351 @@ function Library:AddBlank(Frame: GuiObject, Size: UDim2)
     })
 end
 
+--// Groupbox Dragging \\--
+--// Active avec Library:SetGroupboxDragging(true) (ex: depuis un toggle dans les parametres).
+--// Maintiens le header d'un bloc et deplace-le : il se detache, suit la souris avec un lissage,
+--// et un emplacement fantome se deplace en douceur entre les colonnes gauche / droite.
+do
+    Library.GroupboxDragging = false
+    Library.GroupboxDragThreshold = 6 --// pixels avant que le bloc se detache
+    Library.GroupboxDragSmoothness = 18 --// plus haut = suit la souris plus vite
+    Library.GroupboxLiftScale = 1.03 --// leger agrandissement quand le bloc est tenu
+    Library.GroupboxSlotTweenInfo = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    Library.GroupboxLandTweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    Library.BoxOrderGap = 1024
+    Library.DraggingBox = nil
+
+    local OrderLimit = 100000000
+    local AutoScrollEdge = 36
+    local AutoScrollSpeed = 700
+
+    function Library:SetGroupboxDragging(Enabled: boolean)
+        Library.GroupboxDragging = Enabled == true
+    end
+
+    --// Liste triee des blocs d'une colonne (ignore les spacers aux extremites)
+    local function GetSideBoxes(Side, Excluded)
+        local List = {}
+
+        for Idx, Child in Side:GetChildren() do
+            if Child:IsA("Frame") and math.abs(Child.LayoutOrder) < OrderLimit and not (Excluded and Excluded[Child]) then
+                table.insert(List, { Child = Child, Idx = Idx })
+            end
+        end
+
+        table.sort(List, function(A, B)
+            if A.Child.LayoutOrder ~= B.Child.LayoutOrder then
+                return A.Child.LayoutOrder < B.Child.LayoutOrder
+            end
+
+            return A.Idx < B.Idx
+        end)
+
+        local Result = {}
+        for _, Entry in List do
+            table.insert(Result, Entry.Child)
+        end
+
+        return Result
+    end
+
+    local function RenumberSide(Side)
+        for Idx, Child in GetSideBoxes(Side) do
+            Child.LayoutOrder = Idx * Library.BoxOrderGap
+        end
+    end
+
+    local function GetOrderBetween(Ordered, InsertAt)
+        local Gap = Library.BoxOrderGap
+        local Prev, Next = Ordered[InsertAt - 1], Ordered[InsertAt]
+
+        if Prev and Next then
+            if Next.LayoutOrder - Prev.LayoutOrder < 2 then
+                return nil --// plus de place entre les deux, il faut renumeroter
+            end
+
+            return math.floor((Prev.LayoutOrder + Next.LayoutOrder) / 2)
+        elseif Prev then
+            return Prev.LayoutOrder + Gap
+        elseif Next then
+            return Next.LayoutOrder - Gap
+        end
+
+        return Gap
+    end
+
+    local function RunBoxDrag(Tab, BoxHolder: Frame, Input: InputObject)
+        local Sides = Tab.Sides
+        local TabContainer = Sides[1].Parent
+        local Scale = Library.DPIScale
+
+        local OriginSide = BoxHolder.Parent
+        local WasVisible = BoxHolder.Visible
+        local AbsPos, AbsSize = BoxHolder.AbsolutePosition, BoxHolder.AbsoluteSize
+        local Height = AbsSize.Y / Scale
+
+        local Ghost, GhostScale
+        local Slot, SlotSide, SlotPrev
+
+        local function RetireSlot(Old)
+            Old:SetAttribute("Retiring", true)
+
+            local Tween = TweenService:Create(Old, Library.GroupboxSlotTweenInfo, {
+                Size = UDim2.new(1, 0, 0, 0),
+            })
+            Tween.Completed:Once(function()
+                Old:Destroy()
+            end)
+            Tween:Play()
+        end
+
+        local function MakeSlot(Side, Order, Instant)
+            local NewSlot = New("Frame", {
+                BackgroundTransparency = 1,
+                ClipsDescendants = true,
+                LayoutOrder = Order,
+                Size = UDim2.new(1, 0, 0, Instant and Height or 0),
+                Parent = Side,
+            })
+
+            local Inner = New("Frame", {
+                BackgroundColor3 = "AccentColor",
+                BackgroundTransparency = 0.9,
+                Position = UDim2.fromOffset(1, 4),
+                Size = UDim2.new(1, -2, 1, -8),
+                Parent = NewSlot,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(0, Library.CornerRadius),
+                Parent = Inner,
+            })
+            New("UIStroke", {
+                Color = "AccentColor",
+                Thickness = 1,
+                Transparency = 0.5,
+                Parent = Inner,
+            })
+
+            if not Instant then
+                TweenService:Create(NewSlot, Library.GroupboxSlotTweenInfo, {
+                    Size = UDim2.new(1, 0, 0, Height),
+                }):Play()
+            end
+
+            return NewSlot
+        end
+
+        --// Cherche ou inserer le bloc selon la position de la souris
+        local function FindTarget(MouseY, SideIdx)
+            local Side = Sides[SideIdx]
+
+            for _ = 1, 2 do
+                local Ordered = GetSideBoxes(Side, { [Slot] = true, [BoxHolder] = true })
+
+                local InsertAt = #Ordered + 1
+                for Idx, Child in Ordered do
+                    if Child.Visible and Child:GetAttribute("Retiring") ~= true then
+                        if Child.AbsolutePosition.Y + Child.AbsoluteSize.Y / 2 > MouseY then
+                            InsertAt = Idx
+                            break
+                        end
+                    end
+                end
+
+                local Order = GetOrderBetween(Ordered, InsertAt)
+                if Order then
+                    return Side, Order, Ordered[InsertAt - 1]
+                end
+
+                RenumberSide(Side)
+            end
+
+            return SlotSide, Slot.LayoutOrder, SlotPrev
+        end
+
+        local Success, ErrorMessage = pcall(function()
+            --// Bloc precedent dans la colonne d'origine (pour ne pas recreer l'emplacement au depart)
+            local OriginList = GetSideBoxes(OriginSide)
+            for Idx, Child in OriginList do
+                if Child == BoxHolder then
+                    SlotPrev = OriginList[Idx - 1]
+                    break
+                end
+            end
+            SlotSide = OriginSide
+
+            --// Fantome (copie visuelle du bloc) qui suit la souris
+            local Center = AbsPos + AbsSize / 2
+            local Grab = Vector2.new(Mouse.X, Mouse.Y) - Center
+            local Current = Center
+
+            Ghost = New("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundTransparency = 1,
+                Position = UDim2.fromOffset(Center.X, Center.Y),
+                Size = UDim2.fromOffset(AbsSize.X / Scale, Height),
+                ZIndex = 1000,
+                Parent = Library.ScreenGui,
+            })
+            GhostScale = New("UIScale", {
+                Scale = Scale,
+                Parent = Ghost,
+            })
+
+            local Clone = BoxHolder:Clone()
+            Clone.Parent = Ghost
+
+            --// Emplacement a la place exacte du bloc, puis le vrai bloc est cache
+            Slot = MakeSlot(OriginSide, BoxHolder.LayoutOrder, true)
+            BoxHolder.Visible = false
+
+            --// Le bloc "se souleve" en douceur
+            TweenService:Create(GhostScale, Library.GroupboxLandTweenInfo, {
+                Scale = Scale * Library.GroupboxLiftScale,
+            }):Play()
+
+            for _, Side in Sides do
+                Side.ScrollingEnabled = false
+            end
+
+            local Last = os.clock()
+            while IsDragInput(Input) and not Library.Unloaded and BoxHolder.Parent and Ghost.Parent do
+                local Now = os.clock()
+                local DeltaTime = math.min(Now - Last, 0.1)
+                Last = Now
+
+                local MousePos = Vector2.new(Mouse.X, Mouse.Y)
+
+                --// Suivi lisse de la souris
+                local Alpha = 1 - math.exp(-Library.GroupboxDragSmoothness * DeltaTime)
+                Current = Current:Lerp(MousePos - Grab, Alpha)
+                Ghost.Position = UDim2.fromOffset(Current.X, Current.Y)
+
+                --// Colonne visee : gauche ou droite selon la moitie ou se trouve la souris
+                local CenterX = TabContainer.AbsolutePosition.X + TabContainer.AbsoluteSize.X / 2
+                local SideIdx = MousePos.X < CenterX and 1 or 2
+
+                local Side, Order, Prev = FindTarget(MousePos.Y, SideIdx)
+                if Side ~= SlotSide or Prev ~= SlotPrev then
+                    RetireSlot(Slot)
+                    Slot = MakeSlot(Side, Order, false)
+                    SlotSide, SlotPrev = Side, Prev
+                end
+
+                --// Defilement automatique pres des bords
+                local Top = TabContainer.AbsolutePosition.Y
+                local Bottom = Top + TabContainer.AbsoluteSize.Y
+                local ScrollSide = Sides[SideIdx]
+
+                if MousePos.Y < Top + AutoScrollEdge then
+                    ScrollSide.CanvasPosition = Vector2.new(0, math.max(0, ScrollSide.CanvasPosition.Y - AutoScrollSpeed * DeltaTime))
+                elseif MousePos.Y > Bottom - AutoScrollEdge then
+                    ScrollSide.CanvasPosition = Vector2.new(0, ScrollSide.CanvasPosition.Y + AutoScrollSpeed * DeltaTime)
+                end
+
+                RunService.RenderStepped:Wait()
+            end
+
+            --// Relache : le bloc glisse jusqu'a son emplacement
+            if Slot and Slot.Parent and Ghost.Parent then
+                local LandCenter = Slot.AbsolutePosition + AbsSize / 2
+
+                local LandTween = TweenService:Create(Ghost, Library.GroupboxLandTweenInfo, {
+                    Position = UDim2.fromOffset(LandCenter.X, LandCenter.Y),
+                })
+                TweenService:Create(GhostScale, Library.GroupboxLandTweenInfo, {
+                    Scale = Scale,
+                }):Play()
+                LandTween:Play()
+                LandTween.Completed:Wait()
+
+                local Deadline = os.clock() + 0.4
+                while Slot.Parent and Slot.AbsoluteSize.Y / Scale < Height - 1 and os.clock() < Deadline do
+                    RunService.RenderStepped:Wait()
+                end
+            end
+        end)
+
+        --// Nettoyage (toujours execute, meme en cas d'erreur)
+        if Slot and Slot.Parent and BoxHolder.Parent then
+            BoxHolder.LayoutOrder = Slot.LayoutOrder
+            BoxHolder.Parent = Slot.Parent
+        end
+        if Slot then
+            Slot:Destroy()
+        end
+
+        BoxHolder.Visible = WasVisible
+
+        if Ghost then
+            Ghost:Destroy()
+        end
+
+        for _, Side in Sides do
+            Side.ScrollingEnabled = true
+        end
+
+        if not Success then
+            warn("[Obsidian] Groupbox drag error:", ErrorMessage)
+        end
+    end
+
+    --// Handle = zone qu'on maintient pour deplacer le bloc (le header)
+    --// ShouldIgnore(Input) -> true pour ignorer (ex: clic sur la fleche de collapse)
+    function Library:MakeBoxDraggable(Tab, BoxHolder: Frame, Handle: GuiObject, ShouldIgnore: ((InputObject) -> boolean)?)
+        Library:GiveSignal(Handle.InputBegan:Connect(function(Input: InputObject)
+            if not Library.GroupboxDragging or Library.DraggingBox or Library.Unloaded then
+                return
+            end
+
+            if not IsClickInput(Input) then
+                return
+            end
+
+            if ShouldIgnore and ShouldIgnore(Input) then
+                return
+            end
+
+            local StartMouse = Vector2.new(Mouse.X, Mouse.Y)
+
+            task.spawn(function()
+                while IsDragInput(Input) and Library.GroupboxDragging and not Library.Unloaded and BoxHolder.Parent do
+                    local Moved = (Vector2.new(Mouse.X, Mouse.Y) - StartMouse).Magnitude
+
+                    if Moved >= Library.GroupboxDragThreshold then
+                        if Library.DraggingBox then
+                            return
+                        end
+
+                        Library.DraggingBox = BoxHolder
+                        RunBoxDrag(Tab, BoxHolder, Input)
+                        Library.DraggingBox = nil
+
+                        return
+                    end
+
+                    RunService.RenderStepped:Wait()
+                end
+            end)
+        end))
+    end
+end
+
 --// Animations \\--
 local TransparencyCache = {}
 local ActiveTabTweens = setmetatable({}, { __mode = "k" })
 
-function Library:PlayTabAnimation(TabCanvas: CanvasGroup, Showing: boolean, OnComplete: (() -> ())?)
-    if not TabCanvas then
+local ActiveCoverTween
+
+function Library:PlayTabAnimation(TabCanvas: GuiObject, Showing: boolean, OnComplete: (() -> ())?)
+    local function Finish()
         if OnComplete then
             OnComplete()
         end
+    end
 
+    if not TabCanvas then
+        Finish()
         return
     end
 
@@ -2073,103 +2408,101 @@ function Library:PlayTabAnimation(TabCanvas: CanvasGroup, Showing: boolean, OnCo
         ActiveTabTweens[TabCanvas] = nil
     end
 
-    local BaseZIndex = TabCanvas.ZIndex
-    if not (Library.Animations and Library.Animations.TabSwitch) then
-        TabCanvas.Visible = Showing
-        TabCanvas.GroupTransparency = Showing and 0 or 1
+    local Cover = Library.TabFadeCover
+    if Cover and not Cover.Parent then
+        Cover = nil
+    end
+
+    --// Tab qui se cache : disparition immediate, le cache de fondu masque la transition
+    if not Showing then
+        TabCanvas.Visible = false
         TabCanvas.Position = UDim2.fromScale(0, 0)
-        TabCanvas.ZIndex = BaseZIndex
 
-        if OnComplete then
-            OnComplete()
-        end
-
+        Finish()
         return
     end
 
-    if Showing then
-        local TweenInfo = Library.TabTransitionInfo or TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-        local Offset = Library.TabSwipeOffset or 26
-        local SwipeFrom = string.lower(Library.TabSwipeFrom or "bottom")
-        local StartPosition
-
-        if SwipeFrom == "left" then
-            StartPosition = UDim2.fromOffset(-Offset, 0)
-        elseif SwipeFrom == "top" then
-            StartPosition = UDim2.fromOffset(0, -Offset)
-        elseif SwipeFrom == "right" then
-            StartPosition = UDim2.fromOffset(Offset, 0)
-        else -- bottom (Default)
-            StartPosition = UDim2.fromOffset(0, Offset)
+    --// Pas d'animation : affichage direct
+    if not (Library.Animations and Library.Animations.TabSwitch) or not Cover then
+        if ActiveCoverTween then
+            StopTween(ActiveCoverTween, true)
+            ActiveCoverTween = nil
         end
 
-        TabCanvas.ZIndex = BaseZIndex + 1
-        TabCanvas.GroupTransparency = 1
-        TabCanvas.Position = StartPosition
+        if Cover then
+            Cover.Visible = false
+        end
+
+        TabCanvas.Position = UDim2.fromScale(0, 0)
         TabCanvas.Visible = true
 
-        local Tween = TweenService:Create(TabCanvas, TweenInfo, {
-            GroupTransparency = 0,
-            Position = UDim2.fromScale(0, 0)
-        })
-
-        ActiveTabTweens[TabCanvas] = Tween
-        Tween:Play()
-
-        local Connection; Connection = Tween.Completed:Connect(function(PlaybackState)
-            if Connection then
-                Connection:Disconnect()
-            end
-
-            if ActiveTabTweens[TabCanvas] == Tween then
-                ActiveTabTweens[TabCanvas] = nil
-            end
-
-            if PlaybackState == Enum.PlaybackState.Cancelled then
-                return
-            end
-
-            TabCanvas.ZIndex = BaseZIndex
-            if OnComplete then
-                OnComplete()
-            end
-        end)
-    else
-        local TweenInfo = Library.TabTransitionInfo or TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-
-        TabCanvas.ZIndex = BaseZIndex
-        TabCanvas.Position = UDim2.fromScale(0, 0)
-
-        local Tween = TweenService:Create(TabCanvas, TweenInfo, {
-            GroupTransparency = 1
-        })
-
-        ActiveTabTweens[TabCanvas] = Tween
-        Tween:Play()
-
-        local Connection; Connection = Tween.Completed:Connect(function(PlaybackState)
-            if Connection then
-                Connection:Disconnect()
-            end
-
-            if ActiveTabTweens[TabCanvas] == Tween then
-                ActiveTabTweens[TabCanvas] = nil
-            end
-
-            if PlaybackState == Enum.PlaybackState.Cancelled then
-                return
-            end
-
-            TabCanvas.Visible = false
-            TabCanvas.GroupTransparency = 1
-            TabCanvas.Position = UDim2.fromScale(0, 0)
-            TabCanvas.ZIndex = BaseZIndex
-
-            if OnComplete then
-                OnComplete()
-            end
-        end)
+        Finish()
+        return
     end
+
+    local TweenInfo = Library.TabTransitionInfo or TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local Offset = Library.TabSwipeOffset or 26
+    local SwipeFrom = string.lower(Library.TabSwipeFrom or "bottom")
+    local StartPosition
+
+    if SwipeFrom == "left" then
+        StartPosition = UDim2.fromOffset(-Offset, 0)
+    elseif SwipeFrom == "top" then
+        StartPosition = UDim2.fromOffset(0, -Offset)
+    elseif SwipeFrom == "right" then
+        StartPosition = UDim2.fromOffset(Offset, 0)
+    else -- bottom (Default)
+        StartPosition = UDim2.fromOffset(0, Offset)
+    end
+
+    if ActiveCoverTween then
+        StopTween(ActiveCoverTween, true)
+        ActiveCoverTween = nil
+    end
+
+    --// Le cache a exactement la couleur du fond : il part opaque puis devient transparent,
+    --// ce qui donne un fondu sans passer par un CanvasGroup (source du flash blanc).
+    Cover.BackgroundTransparency = 0
+    Cover.Visible = true
+
+    TabCanvas.Position = StartPosition
+    TabCanvas.Visible = true
+
+    local Tween = TweenService:Create(TabCanvas, TweenInfo, {
+        Position = UDim2.fromScale(0, 0)
+    })
+    local CoverTween = TweenService:Create(Cover, TweenInfo, {
+        BackgroundTransparency = 1
+    })
+
+    ActiveTabTweens[TabCanvas] = Tween
+    ActiveCoverTween = CoverTween
+
+    Tween:Play()
+    CoverTween:Play()
+
+    local Connection; Connection = CoverTween.Completed:Connect(function(PlaybackState)
+        if Connection then
+            Connection:Disconnect()
+        end
+
+        if ActiveCoverTween == CoverTween then
+            ActiveCoverTween = nil
+        end
+
+        if PlaybackState == Enum.PlaybackState.Cancelled then
+            return
+        end
+
+        if ActiveTabTweens[TabCanvas] == Tween then
+            ActiveTabTweens[TabCanvas] = nil
+        end
+
+        TabCanvas.Position = UDim2.fromScale(0, 0)
+        Cover.Visible = false
+
+        Finish()
+    end)
 end
 
 --// Deprecated \\--
@@ -9852,6 +10185,19 @@ function Library:CreateWindow(WindowInfo)
         })
 
         Library.WindowContainer = Container
+
+        --// Cache de fondu des tabs (meme couleur que le fond, remplace le CanvasGroup)
+        Library.TabFadeCover = New("Frame", {
+            BackgroundColor3 = function()
+                return Library:GetBetterColor(Library.Scheme.BackgroundColor, 1)
+            end,
+            BackgroundTransparency = 1,
+            Name = "TabFadeCover",
+            Size = UDim2.fromScale(1, 1),
+            Visible = false,
+            ZIndex = 100,
+            Parent = Container,
+        })
     end
 
     --// Window Table \\--
@@ -10169,10 +10515,9 @@ function Library:CreateWindow(WindowInfo)
             })
 
             --// Tab Canvas \\--
-            TabCanvas = New("CanvasGroup", {
+            TabCanvas = New("Frame", {
                 BackgroundTransparency = 1,
                 ClipsDescendants = true,
-                GroupTransparency = 0,
                 Size = UDim2.fromScale(1, 1),
                 Visible = false,
                 Parent = Container,
@@ -10210,12 +10555,12 @@ function Library:CreateWindow(WindowInfo)
             do
                 New("Frame", {
                     BackgroundTransparency = 1,
-                    LayoutOrder = -1,
+                    LayoutOrder = -1000000000,
                     Parent = TabLeft,
                 })
                 New("Frame", {
                     BackgroundTransparency = 1,
-                    LayoutOrder = 1,
+                    LayoutOrder = 1000000000,
                     Parent = TabLeft,
                 })
             end
@@ -10245,12 +10590,12 @@ function Library:CreateWindow(WindowInfo)
             do
                 New("Frame", {
                     BackgroundTransparency = 1,
-                    LayoutOrder = -1,
+                    LayoutOrder = -1000000000,
                     Parent = TabRight,
                 })
                 New("Frame", {
                     BackgroundTransparency = 1,
-                    LayoutOrder = 1,
+                    LayoutOrder = 1000000000,
                     Parent = TabRight,
                 })
             end
@@ -10356,6 +10701,7 @@ function Library:CreateWindow(WindowInfo)
                 TabLeft,
                 TabRight,
             },
+            NextBoxOrder = 0,
             WarningBox = {
                 IsNormal = false,
                 LockSize = false,
@@ -10441,6 +10787,11 @@ function Library:CreateWindow(WindowInfo)
             end
         end
 
+        function Tab:TakeBoxOrder()
+            Tab.NextBoxOrder = Tab.NextBoxOrder + Library.BoxOrderGap
+            return Tab.NextBoxOrder
+        end
+
         function Tab:RefreshSides()
             local Offset = WarningBoxHolder.Visible and WarningBox.Size.Y.Offset + 8 or 0
             for _, Side in Tab.Sides do
@@ -10476,6 +10827,7 @@ function Library:CreateWindow(WindowInfo)
 
         local function AddTabbox(self, Info)
             local ParentObj = self
+            local WindowTab = Tab
 
             if typeof(Info.Side) == "string" then
                 local lowerSide = string.lower(Info.Side)
@@ -10489,6 +10841,7 @@ function Library:CreateWindow(WindowInfo)
             local BoxHolder = New("Frame", {
                 AutomaticSize = Enum.AutomaticSize.Y,
                 BackgroundTransparency = 1,
+                LayoutOrder = if ParentObj.Type == "Groupbox" then 0 else Tab:TakeBoxOrder(),
                 Size = UDim2.fromScale(1, 0),
                 Parent = if ParentObj.Type == "Groupbox" then ParentObj.Container else (Info.Side == 1 and TabLeft or TabRight),
             })
@@ -10754,6 +11107,10 @@ function Library:CreateWindow(WindowInfo)
 
                 Button.MouseButton1Click:Connect(Tab.Show)
 
+                if ParentObj.Type ~= "Groupbox" then
+                    Library:MakeBoxDraggable(WindowTab, BoxHolder, Button)
+                end
+
                 setmetatable(Tab, BaseGroupbox)
 
                 Tabbox.Tabs[TabStoringIndex] = Tab
@@ -10819,6 +11176,7 @@ function Library:CreateWindow(WindowInfo)
                 AutomaticSize = Enum.AutomaticSize.Y,
                 BackgroundTransparency = 1,
                 Size = UDim2.fromScale(1, 0),
+                LayoutOrder = Tab:TakeBoxOrder(),
                 Parent = (Info.Side == 1) and TabLeft or TabRight,
             })
             New("UIListLayout", {
@@ -11144,6 +11502,18 @@ function Library:CreateWindow(WindowInfo)
                 end)
             end
 
+            Library:MakeBoxDraggable(Tab, BoxHolder, GroupboxTop, function()
+                if GroupboxCollapseArrow and GroupboxCollapseArrow.Visible then
+                    local ArrowPos, ArrowSize = GroupboxCollapseArrow.AbsolutePosition, GroupboxCollapseArrow.AbsoluteSize
+                    return Mouse.X >= ArrowPos.X
+                        and Mouse.X <= ArrowPos.X + ArrowSize.X
+                        and Mouse.Y >= ArrowPos.Y
+                        and Mouse.Y <= ArrowPos.Y + ArrowSize.Y
+                end
+
+                return false
+            end)
+
             Groupbox.AddTabbox = AddTabbox
             setmetatable(Groupbox, BaseGroupbox)
 
@@ -11395,10 +11765,9 @@ function Library:CreateWindow(WindowInfo)
             })
 
             --// Tab Canvas \\--
-            TabCanvas = New("CanvasGroup", {
+            TabCanvas = New("Frame", {
                 BackgroundTransparency = 1,
                 ClipsDescendants = true,
-                GroupTransparency = 0,
                 Size = UDim2.fromScale(1, 1),
                 Visible = false,
                 Parent = Container,
