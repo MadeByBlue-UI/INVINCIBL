@@ -1149,6 +1149,242 @@ function Library:GiveSignal(Connection: RBXScriptConnection | RBXScriptSignal)
     return Connection
 end
 
+--// Smooth number animation (slider values, label stats, watermark)
+Library.AnimateNumbers = true --// set to false to disable all number animations
+Library.NumberTweenTime = 0.2 --// seconds
+Library.SmoothSliderFill = true --// also slides the slider bar instead of snapping
+
+local NumberStates = setmetatable({}, { __mode = "k" })
+local ActiveNumberStates = {}
+local NumberConnection = nil
+
+local function ParseNumberText(Text: string)
+    local Parts = {}
+    local Buffer = {}
+    local Index = 1
+    local Length = #Text
+
+    local function Flush()
+        if #Buffer > 0 then
+            table.insert(Parts, { Literal = table.concat(Buffer) })
+            table.clear(Buffer)
+        end
+    end
+
+    while Index <= Length do
+        local Char = Text:sub(Index, Index)
+
+        --// never touch numbers inside rich text tags (colors like #FF0000)
+        if Char == "<" then
+            local CloseAt = Text:find(">", Index, true)
+            if CloseAt then
+                table.insert(Buffer, Text:sub(Index, CloseAt))
+                Index = CloseAt + 1
+                continue
+            end
+        end
+
+        local Start, End = Text:find("^%-?%d+%.%d+", Index)
+        if not Start then
+            Start, End = Text:find("^%-?%d+", Index)
+        end
+
+        if not Start then
+            table.insert(Buffer, Char)
+            Index += 1
+            continue
+        end
+
+        local Token = Text:sub(Start, End)
+        local Previous = Index > 1 and Text:sub(Index - 1, Index - 1) or ""
+
+        --// "a-1" / "5-3": the minus is a separator, not a sign
+        if Token:sub(1, 1) == "-" and Previous:match("[%w%.]") then
+            table.insert(Buffer, "-")
+            Index += 1
+            continue
+        end
+
+        --// "v4", "R6", "#123": part of a name, keep as text
+        local Value = tonumber(Token)
+        if not Value or Previous:match("[%a_#]") then
+            table.insert(Buffer, Token)
+            Index = End + 1
+            continue
+        end
+
+        local Whole, Fraction = Token:match("^%-?(%d+)%.?(%d*)$")
+        local Following = Text:sub(End + 1, End + 1)
+
+        Flush()
+        table.insert(Parts, {
+            Value = Value,
+            Decimals = #Fraction,
+            Pad = (#Whole > 1 and Whole:sub(1, 1) == "0" and Token:sub(1, 1) ~= "-") and #Whole or 0,
+            --// clocks (12:34), huge ids: jump directly instead of rolling
+            Snap = Previous == ":" or Following == ":" or #Whole > 9,
+        })
+        Index = End + 1
+    end
+
+    Flush()
+    return Parts
+end
+
+local function FormatNumberPart(Part, Value: number)
+    if Part.Decimals > 0 then
+        return string.format("%." .. Part.Decimals .. "f", Value)
+    end
+
+    local Rounded = math.floor(Value + 0.5)
+    if Part.Pad > 0 then
+        return string.format("%0" .. Part.Pad .. "d", Rounded)
+    end
+
+    return string.format("%d", Rounded)
+end
+
+local function StepNumbers()
+    if next(ActiveNumberStates) == nil then
+        return
+    end
+
+    local Now = os.clock()
+    local Duration = math.max(Library.NumberTweenTime, 0.01)
+
+    for State in ActiveNumberStates do
+        local Label = State.Label
+
+        if not Label or not Label.Parent then
+            ActiveNumberStates[State] = nil
+            continue
+        end
+
+        local Alpha = math.clamp((Now - State.Start) / Duration, 0, 1)
+
+        if Alpha >= 1 then
+            ActiveNumberStates[State] = nil
+
+            for Index, Part in State.Parts do
+                if Part.Literal == nil then
+                    State.Current[Index] = Part.Value
+                end
+            end
+
+            Label.Text = State.FinalText
+            continue
+        end
+
+        local Eased = 1 - (1 - Alpha) ^ 3
+        local Out = table.create(#State.Parts)
+
+        for Index, Part in State.Parts do
+            if Part.Literal ~= nil then
+                Out[Index] = Part.Literal
+            else
+                local From = State.From[Index]
+                local Value = From + (Part.Value - From) * Eased
+
+                State.Current[Index] = Value
+                Out[Index] = FormatNumberPart(Part, Value)
+            end
+        end
+
+        Label.Text = table.concat(Out)
+    end
+end
+
+function Library:SetNumberText(Label: TextLabel, Text: string)
+    Text = tostring(Text)
+
+    if Library.Unloaded or not Library.AnimateNumbers then
+        local Existing = NumberStates[Label]
+        if Existing then
+            ActiveNumberStates[Existing] = nil
+            NumberStates[Label] = nil
+        end
+
+        Label.Text = Text
+        return
+    end
+
+    local Parts = ParseNumberText(Text)
+    local State = NumberStates[Label]
+
+    --// same text as the current target: nothing to do (keeps running animations alive)
+    if State and State.FinalText == Text then
+        return
+    end
+
+    local Compatible = State ~= nil and #State.Parts == #Parts
+    if Compatible then
+        for Index, Part in Parts do
+            local Old = State.Parts[Index]
+
+            if (Old.Literal ~= nil) ~= (Part.Literal ~= nil) then
+                Compatible = false
+                break
+            end
+
+            if Part.Literal ~= nil then
+                if Old.Literal ~= Part.Literal then
+                    Compatible = false
+                    break
+                end
+            elseif Old.Decimals ~= Part.Decimals then
+                Compatible = false
+                break
+            end
+        end
+    end
+
+    if not Compatible then
+        if State then
+            ActiveNumberStates[State] = nil
+        end
+
+        State = { Label = Label, Parts = Parts, FinalText = Text, Current = {}, From = {}, Start = 0 }
+
+        for Index, Part in Parts do
+            if Part.Literal == nil then
+                State.Current[Index] = Part.Value
+            end
+        end
+
+        NumberStates[Label] = State
+        Label.Text = Text
+        return
+    end
+
+    State.Parts = Parts
+    State.FinalText = Text
+
+    local Distance = 0
+    for Index, Part in Parts do
+        if Part.Literal == nil then
+            if Part.Snap then
+                State.Current[Index] = Part.Value
+            end
+
+            State.From[Index] = State.Current[Index]
+            Distance = math.max(Distance, math.abs(Part.Value - State.Current[Index]))
+        end
+    end
+
+    if Distance == 0 then
+        ActiveNumberStates[State] = nil
+        Label.Text = Text
+        return
+    end
+
+    State.Start = os.clock()
+    ActiveNumberStates[State] = true
+
+    if not NumberConnection or not NumberConnection.Connected then
+        NumberConnection = Library:GiveSignal(RunService.RenderStepped:Connect(StepNumbers))
+    end
+end
+
 function IsValidCustomIcon(Icon: string)
     return typeof(Icon) == "string" and (Icon:match("^rbxasset://textures/") or Icon:match("roblox%.com/asset/%?id=") or Icon:match("rbxthumb://type="))
 end
@@ -2004,7 +2240,7 @@ function Library:AddDraggableLabel(...)
     Library:MakeDraggable(Label, Label, true)
 
     function DraggableLabel:SetText(Text: string)
-        Label.Text = Text
+        Library:SetNumberText(Label, Text)
     end
 
     function DraggableLabel:SetIcon(NewIcon: string)
@@ -4982,7 +5218,7 @@ do
 
         function Label:SetText(Text: string)
             Label.Text = Text
-            TextLabel.Text = Text
+            Library:SetNumberText(TextLabel, Text)
 
             Label:Display()
             Groupbox:Resize()
@@ -6370,26 +6606,30 @@ do
             Library.Registry[Fill].BackgroundColor3 = Slider.Disabled and "OutlineColor" or "AccentColor"
         end
 
+        local FillTween = nil
+        local LastFillScale = nil
+
         function Slider:Display()
             if Library.Unloaded then
                 return
             end
 
+            local DisplayText = nil
             local CustomDisplayText = nil
             if Info.FormatDisplayValue then
                 CustomDisplayText = Info.FormatDisplayValue(Slider, Slider.Value)
             end
 
             if CustomDisplayText then
-                DisplayLabel.Text = tostring(CustomDisplayText)
+                DisplayText = tostring(CustomDisplayText)
             else
                 if Info.Compact then
-                    DisplayLabel.Text =
+                    DisplayText =
                         string.format("%s: %s%s%s", Slider.Text, Slider.Prefix, Slider.Value, Slider.Suffix)
                 elseif Info.HideMax then
-                    DisplayLabel.Text = string.format("%s%s%s", Slider.Prefix, Slider.Value, Slider.Suffix)
+                    DisplayText = string.format("%s%s%s", Slider.Prefix, Slider.Value, Slider.Suffix)
                 else
-                    DisplayLabel.Text = string.format(
+                    DisplayText = string.format(
                         "%s%s%s/%s%s%s",
                         Slider.Prefix,
                         Slider.Value,
@@ -6401,8 +6641,31 @@ do
                 end
             end
 
+            Library:SetNumberText(DisplayLabel, DisplayText)
+
             local X = (Slider.Value - Slider.Min) / (Slider.Max - Slider.Min)
-            Fill.Size = UDim2.fromScale(X, 1)
+            if Library.SmoothSliderFill and Library.AnimateNumbers and LastFillScale ~= nil then
+                if LastFillScale ~= X then
+                    if FillTween then
+                        FillTween:Cancel()
+                    end
+
+                    FillTween = TweenService:Create(
+                        Fill,
+                        TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                        { Size = UDim2.fromScale(X, 1) }
+                    )
+                    FillTween:Play()
+                end
+            else
+                if FillTween then
+                    FillTween:Cancel()
+                    FillTween = nil
+                end
+
+                Fill.Size = UDim2.fromScale(X, 1)
+            end
+            LastFillScale = X
         end
 
         function Slider:OnChanged(Func)
