@@ -7106,8 +7106,11 @@ do
             Size = UDim2.new(1, 0, 0, 21),
             Text = Input.Value,
             TextEditable = not Input.Disabled,
-            TextScaled = true,
+            TextSize = 14,
+            TextWrapped = true,
+            MultiLine = (not Input.Finished) and (not Input.Numeric),
             TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
             Parent = Holder,
         })
 
@@ -7131,6 +7134,42 @@ do
                 Parent = Box,
             })
         )
+
+        -- la taille du texte reste fixe (14) : la zone de texte passe a la ligne et grandit en hauteur,
+        -- et le groupbox grandit avec elle
+        local BoxMinHeight = 21
+        local BoxVerticalPadding = 7 -- PaddingTop (4) + PaddingBottom (3)
+        local BoxLabelSpace = 18 -- Holder = Label + espace + Box (39 - 21)
+        local LastBoxHeight = BoxMinHeight
+
+        local function FitBox()
+            if Input.Destroyed or not Box.Parent then
+                return
+            end
+
+            local Needed = math.max(BoxMinHeight, math.ceil(Box.TextBounds.Y / Library.DPIScale) + BoxVerticalPadding)
+            if Info.MaxHeight then
+                Needed = math.min(Needed, Info.MaxHeight)
+            end
+
+            if Needed == LastBoxHeight then
+                return
+            end
+            LastBoxHeight = Needed
+
+            Box.Size = UDim2.new(1, 0, 0, Needed)
+            Holder.Size = UDim2.new(1, 0, 0, Needed + BoxLabelSpace)
+            Groupbox:Resize()
+            task.defer(function()
+                if not Input.Destroyed then
+                    Groupbox:Resize()
+                end
+            end)
+        end
+
+        table.insert(Input.Connections, Box:GetPropertyChangedSignal("TextBounds"):Connect(FitBox))
+        table.insert(Input.Connections, Box:GetPropertyChangedSignal("AbsoluteSize"):Connect(FitBox))
+        task.defer(FitBox)
 
         function Input:UpdateColors()
             if Library.Unloaded then
