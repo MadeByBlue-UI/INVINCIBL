@@ -1429,9 +1429,23 @@ function Library:GetIcon(IconName: string)
     return Icon
 end
 
+--// Anciens logos (ids Roblox) remplaces par une icone lucide. Ajoute d'autres ids ici si besoin.
+Library.IconAliases = {
+    ["108648429085459"] = "galaxy",
+}
+
 function Library:GetCustomIcon(IconName: string): any
     if not IconName then
         return nil
+    end
+
+    local AliasKey = tostring(IconName):gsub("^rbxassetid://", "")
+    local Alias = Library.IconAliases[AliasKey]
+    if Alias then
+        local AliasIcon = Library:GetIcon(Alias)
+        if AliasIcon then
+            return AliasIcon
+        end
     end
 
     if tonumber(IconName) then
@@ -1766,6 +1780,7 @@ Library.SmoothText = {
     SelectionColor = Color3.fromRGB(45, 115, 255),
     SelectionTransparency = 0.5,
     SelectionFade = 0.12,
+    SelectionRadius = 0, --// arrondi du bleu de selection en px (0 = carre, ne depend pas du Corner Radius)
 }
 Library.SmoothTextBoxes = {}
 
@@ -2588,7 +2603,7 @@ do
                 Frame.Parent = S.Content
 
                 local Corner = Instance.new("UICorner")
-                Corner.CornerRadius = UDim.new(0, 2)
+                Corner.CornerRadius = UDim.new(0, Cfg.SelectionRadius or 0)
                 Corner.Parent = Frame
 
                 S.SelRects[Index] = { Frame = Frame, X = T[1], Y = T[3], W = 0, A = 0, Target = 0 }
@@ -2950,7 +2965,24 @@ do
         Box.Focused:Connect(function()
             S.LastActivity = os.clock()
             S.CaretDirty = true
+            S.PhDirty = true
+            S.SelV = -1
+            task.spawn(SafeSync, S, true)
         end)
+
+        -- boite cachee puis reaffichee (ex : barre de recherche d'un dropdown) : on remesure tout et on remet
+        -- le placeholder / la selection, sinon ils restent invisibles tant que la mise en page n'a pas ete refaite
+        local function Reveal()
+            if Box.Visible then
+                S.PhDirty = true
+                S.CaretDirty = true
+                S.SelV = -1
+                S.Overlay.Visible = true
+                task.defer(SafeSync, S, true)
+            end
+        end
+        Box:GetPropertyChangedSignal("Visible"):Connect(Reveal)
+        Box.AncestryChanged:Connect(Reveal)
 
         Box.Destroying:Connect(function()
             S.Dead = true
@@ -3146,10 +3178,58 @@ do
         end
     end
 
+    -- le bouton "3 barres" fait comme la fleche de chaque bloc : il replie / deplie le CONTENU des groupboxes
+    -- (le titre reste visible), un par un. Si au moins un bloc est deplie -> tout se replie, sinon tout se deplie.
     function Library:ToggleBlocks(Tab)
         Tab = Tab or Library.ActiveTab
-        if Tab then
-            Library:SetBlocksHidden(not (Tab.BlocksHidden == true), Tab)
+        if not Tab or Tab.CollapseBusy or Library.Unloaded then
+            return
+        end
+
+        local List = {}
+        for _, Groupbox in Tab.Groupboxes do
+            if Groupbox.DisableCollapsing ~= true
+                and Groupbox.SetCollapsed
+                and Groupbox.BoxHolder
+                and Groupbox.BoxHolder.Visible
+            then
+                table.insert(List, Groupbox)
+            end
+        end
+        if #List == 0 then
+            return
+        end
+
+        -- ordre de lecture : de haut en bas, puis de gauche a droite
+        table.sort(List, function(A, B)
+            local PA, PB = A.BoxHolder.AbsolutePosition, B.BoxHolder.AbsolutePosition
+            if math.abs(PA.Y - PB.Y) > 4 then
+                return PA.Y < PB.Y
+            end
+
+            return PA.X < PB.X
+        end)
+
+        local Collapse = false
+        for _, Groupbox in List do
+            if not Groupbox.Collapsed then
+                Collapse = true
+                break
+            end
+        end
+
+        Tab.CollapseBusy = true
+        local Step = Library.BlocksAnimation.Step
+        for Index, Groupbox in List do
+            task.spawn(function()
+                task.wait((Index - 1) * Step)
+                if not Groupbox.Destroyed and not Library.Unloaded then
+                    pcall(Groupbox.SetCollapsed, Groupbox, Collapse)
+                end
+                if Index == #List then
+                    Tab.CollapseBusy = false
+                end
+            end)
         end
     end
 end
@@ -13466,6 +13546,7 @@ function Library:CreateWindow(WindowInfo)
 
                 Visible = true,
                 Collapsed = false,
+                DisableCollapsing = Info.DisableCollapsing == true,
 
                 BoxHolder = BoxHolder,
                 Holder = GroupboxHolder,
