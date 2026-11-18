@@ -3484,6 +3484,447 @@ function Library:OnUnload(Callback)
     table.insert(Library.UnloadSignals, Callback)
 end
 
+--// Right-click Keybinds (Toggles / Buttons) \\--
+--// No key yet: right click = assign one (keyboard, middle click or right click).
+--// Key already assigned: right click opens a small menu
+--//   Toggles: Toggle / Hold, Change key, Remove key   |   Buttons: Change key, Remove key (always Press)
+--// While assigning: Escape or Delete removes the key, left click cancels.
+Library.RightClickBinds = true
+Library.BindFile = "ElementBinds.json"
+Library.ElementBinds = {} --// [Id] = KeyName
+Library.ElementBindModes = {} --// [Id] = "Hold" (only stored when not the default "Toggle")
+Library.BindElements = {}
+Library.BindListening = nil
+Library.BindListenToken = 0
+Library.BindsLoaded = false
+Library.BindConnection = nil
+
+function Library:LoadBinds()
+    if Library.BindsLoaded then
+        return
+    end
+    Library.BindsLoaded = true
+
+    pcall(function()
+        if isfile and readfile and isfile(Library.BindFile) then
+            local Data = cloneref(game:GetService("HttpService")):JSONDecode(readfile(Library.BindFile))
+
+            if typeof(Data) ~= "table" then
+                return
+            end
+
+            local Keys = typeof(Data.Keys) == "table" and Data.Keys or Data
+            local Modes = typeof(Data.Modes) == "table" and Data.Modes or {}
+
+            for Id, Key in Keys do
+                if typeof(Id) == "string" and typeof(Key) == "string" then
+                    Library.ElementBinds[Id] = Key
+                end
+            end
+
+            for Id, Mode in Modes do
+                if typeof(Id) == "string" and Mode == "Hold" then
+                    Library.ElementBindModes[Id] = "Hold"
+                end
+            end
+        end
+    end)
+end
+
+function Library:SaveBinds()
+    pcall(function()
+        if writefile then
+            writefile(
+                Library.BindFile,
+                cloneref(game:GetService("HttpService")):JSONEncode({
+                    Keys = Library.ElementBinds,
+                    Modes = Library.ElementBindModes,
+                })
+            )
+        end
+    end)
+end
+
+function Library:InputToBindKey(Input: InputObject)
+    local UIType = Input.UserInputType
+
+    if UIType == Enum.UserInputType.Keyboard then
+        if Input.KeyCode == Enum.KeyCode.Unknown then
+            return nil
+        end
+
+        return Input.KeyCode.Name
+    elseif UIType == Enum.UserInputType.MouseButton2 then
+        return "MB2"
+    elseif UIType == Enum.UserInputType.MouseButton3 then
+        return "MB3"
+    end
+
+    return nil
+end
+
+function Library:UpdateBindIndicator(Entry)
+    local Key = Library.ElementBinds[Entry.Id]
+
+    if not Key then
+        if Entry.Indicator then
+            Entry.Indicator.Visible = false
+        end
+
+        return
+    end
+
+    if not Entry.Indicator then
+        Entry.Indicator = New("TextLabel", {
+            AnchorPoint = Vector2.new(1, 1),
+            AutomaticSize = Enum.AutomaticSize.X,
+            BackgroundTransparency = 1,
+            Position = UDim2.new(1, -3, 1, -1),
+            Size = UDim2.fromOffset(0, 10),
+            Text = "",
+            TextColor3 = "FontColor",
+            TextSize = 10,
+            TextTransparency = 0.35,
+            Visible = false,
+            ZIndex = Entry.Gui.ZIndex + 3,
+            Parent = Entry.Gui,
+        })
+    end
+
+    if Entry.IsToggle and Library.ElementBindModes[Entry.Id] == "Hold" then
+        Entry.Indicator.Text = "[" .. Key .. " | Hold]"
+    else
+        Entry.Indicator.Text = "[" .. Key .. "]"
+    end
+
+    Entry.Indicator.Visible = true
+end
+
+function Library:RefreshBindMenu(Entry)
+    if not Entry.MenuItems then
+        return
+    end
+
+    local Current = Library.ElementBindModes[Entry.Id] == "Hold" and "Hold" or "Toggle"
+
+    for Mode, Item in Entry.MenuItems do
+        local Selected = Mode == Current
+
+        Item:SetAttribute("BindSelected", Selected)
+        Item.BackgroundTransparency = Selected and 0 or 1
+        Item.TextTransparency = Selected and 0 or 0.5
+    end
+end
+
+function Library:SetBindKey(Entry, Key)
+    Library.ElementBinds[Entry.Id] = Key
+
+    if not Key then
+        Library.ElementBindModes[Entry.Id] = nil
+    end
+
+    Library:SaveBinds()
+    Library:UpdateBindIndicator(Entry)
+    Library:RefreshBindMenu(Entry)
+end
+
+function Library:SetBindMode(Entry, Mode)
+    if not Entry.IsToggle then
+        return
+    end
+
+    Library.ElementBindModes[Entry.Id] = Mode == "Hold" and "Hold" or nil
+
+    Library:SaveBinds()
+    Library:UpdateBindIndicator(Entry)
+    Library:RefreshBindMenu(Entry)
+end
+
+function Library:AddBindMenuItem(MenuTable, Text, Callback)
+    local Item = New("TextButton", {
+        BackgroundColor3 = "MainColor",
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, 21),
+        Text = Text,
+        TextSize = 14,
+        TextTransparency = 0.5,
+        Parent = MenuTable.Menu,
+    })
+
+    Item.MouseButton1Click:Connect(Callback)
+
+    Item.MouseEnter:Connect(function()
+        if Item:GetAttribute("BindSelected") then
+            return
+        end
+
+        TweenService:Create(Item, Library.TweenInfo, {
+            BackgroundTransparency = 0.7,
+            TextTransparency = 0.1,
+        }):Play()
+    end)
+
+    Item.MouseLeave:Connect(function()
+        if Item:GetAttribute("BindSelected") then
+            return
+        end
+
+        TweenService:Create(Item, Library.TweenInfo, {
+            BackgroundTransparency = 1,
+            TextTransparency = 0.5,
+        }):Play()
+    end)
+
+    return Item
+end
+
+function Library:GetBindMenu(Entry)
+    if Entry.Menu and not Entry.Menu.Destroyed then
+        return Entry.Menu
+    end
+
+    local Gui = Entry.Gui
+    local MenuTable = Library:AddContextMenu(Gui, UDim2.fromOffset(110, 0), function()
+        return { 0, Gui.AbsoluteSize.Y + 1 }
+    end, 1)
+
+    Entry.Menu = MenuTable
+    Entry.MenuItems = {}
+
+    --// Buttons are always "Press", so only Toggles get a mode choice
+    if Entry.IsToggle then
+        for _, Mode in { "Toggle", "Hold" } do
+            Entry.MenuItems[Mode] = Library:AddBindMenuItem(MenuTable, Mode, function()
+                Library:SetBindMode(Entry, Mode)
+                MenuTable:Close()
+            end)
+        end
+    end
+
+    Library:AddBindMenuItem(MenuTable, "Change key", function()
+        MenuTable:Close()
+        Library:StartBindListen(Entry)
+    end)
+
+    Library:AddBindMenuItem(MenuTable, "Remove key", function()
+        MenuTable:Close()
+        Library:SetBindKey(Entry, nil)
+        Library:Notify({ Title = "Keybind removed", Description = Entry.Name, Time = 2 })
+    end)
+
+    Library:RefreshBindMenu(Entry)
+
+    Gui.Destroying:Connect(function()
+        if Entry.Menu then
+            Entry.Menu:Destroy()
+        end
+    end)
+
+    return MenuTable
+end
+
+function Library:StopBindListen()
+    if not Library.BindListening then
+        return
+    end
+
+    Library.BindListening = nil
+    Library.IsPicking = false
+
+    pcall(function()
+        cloneref(game:GetService("ContextActionService")):UnbindAction("ObsidianBindSink")
+    end)
+end
+
+function Library:StartBindListen(Entry)
+    if Library.BindListening or Library.IsPicking or Library.Unloaded then
+        return
+    end
+
+    Library.BindListening = Entry
+    Library.IsPicking = true
+
+    --// Stops Escape from opening the Roblox menu while assigning
+    pcall(function()
+        cloneref(game:GetService("ContextActionService")):BindActionAtPriority("ObsidianBindSink", function()
+            return Enum.ContextActionResult.Sink
+        end, false, Enum.ContextActionPriority.High.Value + 100, Enum.KeyCode.Escape, Enum.KeyCode.Delete)
+    end)
+
+    Library:Notify({
+        Title = "Keybind",
+        Description = `Press a key for "{Entry.Name}"\nEsc / Delete = remove, left click = cancel`,
+        Time = 3,
+    })
+
+    Library.BindListenToken += 1
+    local Token = Library.BindListenToken
+
+    task.delay(10, function()
+        if Library.BindListening == Entry and Library.BindListenToken == Token then
+            Library:StopBindListen()
+            Library:Notify({ Title = "Keybind", Description = "Cancelled", Time = 2 })
+        end
+    end)
+end
+
+function Library:EnsureBindConnection()
+    if Library.BindConnection then
+        return
+    end
+
+    Library.BindConnection = Library:GiveSignal(UserInputService.InputBegan:Connect(function(Input: InputObject)
+        if Library.Unloaded then
+            return
+        end
+
+        local Entry = Library.BindListening
+        if Entry then
+            local UIType = Input.UserInputType
+
+            if UIType == Enum.UserInputType.MouseButton1 or UIType == Enum.UserInputType.Touch then
+                Library:StopBindListen()
+                Library:Notify({ Title = "Keybind", Description = "Cancelled", Time = 2 })
+
+                return
+            end
+
+            if
+                UIType == Enum.UserInputType.Keyboard
+                and (Input.KeyCode == Enum.KeyCode.Escape or Input.KeyCode == Enum.KeyCode.Delete)
+            then
+                Library:StopBindListen()
+                Library:SetBindKey(Entry, nil)
+                Library:Notify({ Title = "Keybind removed", Description = Entry.Name, Time = 2 })
+
+                return
+            end
+
+            local Key = Library:InputToBindKey(Input)
+            if Key then
+                Library:StopBindListen()
+                Library:SetBindKey(Entry, Key)
+                Library:Notify({
+                    Title = "Keybind set",
+                    Description = Entry.Name .. " -> " .. Key .. (Entry.IsToggle and "\nRight click again to change the mode" or ""),
+                    Time = 2.5,
+                })
+
+                --// Toggles: show the Toggle / Hold choice right away
+                if Entry.IsToggle then
+                    task.defer(function()
+                        if not Library.Unloaded and not Entry.Element.Destroyed then
+                            Library:GetBindMenu(Entry):Open()
+                        end
+                    end)
+                end
+            end
+
+            return
+        end
+
+        if UserInputService:GetFocusedTextBox() or Library.IsPicking then
+            return
+        end
+
+        local Key = Library:InputToBindKey(Input)
+        if not Key then
+            return
+        end
+
+        --// Same rule as KeyPickers: mouse binds are ignored while the menu is open
+        if Input.UserInputType ~= Enum.UserInputType.Keyboard and Library.Toggled then
+            return
+        end
+
+        for Index = #Library.BindElements, 1, -1 do
+            local Item = Library.BindElements[Index]
+
+            if not Item or Item.Element.Destroyed then
+                table.remove(Library.BindElements, Index)
+            elseif Library.ElementBinds[Item.Id] == Key then
+                if Item.IsToggle and Library.ElementBindModes[Item.Id] == "Hold" then
+                    if not Item.Holding then
+                        Item.Holding = Key
+                        Library:SafeCallback(Item.Element.SetValue, Item.Element, true)
+                    end
+                else
+                    Library:SafeCallback(Item.Fire)
+                end
+            end
+        end
+    end))
+
+    --// Hold mode: release the toggle when the key is released
+    Library:GiveSignal(UserInputService.InputEnded:Connect(function(Input: InputObject)
+        if Library.Unloaded then
+            return
+        end
+
+        local Key = Library:InputToBindKey(Input)
+        if not Key then
+            return
+        end
+
+        for Index = #Library.BindElements, 1, -1 do
+            local Item = Library.BindElements[Index]
+
+            if Item and Item.Holding == Key then
+                Item.Holding = nil
+
+                if not Item.Element.Destroyed then
+                    Library:SafeCallback(Item.Element.SetValue, Item.Element, false)
+                end
+            end
+        end
+    end))
+end
+
+function Library:RegisterBind(Element, Gui, Id, Name, Fire)
+    if not Library.RightClickBinds or typeof(Gui) ~= "Instance" or not Gui:IsA("GuiButton") then
+        return nil
+    end
+
+    Library:LoadBinds()
+    Library:EnsureBindConnection()
+
+    local Entry = {
+        Id = Id,
+        Name = (tostring(Name):gsub("<[^>]+>", "")),
+        Element = Element,
+        Gui = Gui,
+        Fire = Fire,
+        IsToggle = Element.Type == "Toggle",
+        Holding = nil,
+        Indicator = nil,
+        Menu = nil,
+        MenuItems = nil,
+    }
+
+    table.insert(Library.BindElements, Entry)
+    Element.BindEntry = Entry
+
+    local Connection = Gui.MouseButton2Click:Connect(function()
+        if Library.Unloaded or Library.BindListening or Library.IsPicking then
+            return
+        end
+
+        if Library.ElementBinds[Entry.Id] then
+            Library:GetBindMenu(Entry):Toggle()
+        else
+            Library:StartBindListen(Entry)
+        end
+    end)
+
+    if typeof(Element.Connections) == "table" then
+        table.insert(Element.Connections, Connection)
+    end
+
+    Library:UpdateBindIndicator(Entry)
+
+    return Entry
+end
+
 local CheckIcon, ArrowIcon, ResizeIcon, KeyIcon, MoveIcon
 function Library:SetIconModule(module: IconModule)
     FetchIcons = true
@@ -5918,6 +6359,14 @@ do
                 table.insert(Buttons, SubButton)
             end
 
+            Library:RegisterBind(SubButton, SubButton.Base, "S:" .. tostring(Info.Idx or Info.Text), SubButton.Text, function()
+                if SubButton.Disabled or SubButton.Destroyed then
+                    return
+                end
+
+                Library:SafeCallback(SubButton.Func)
+            end)
+
             SubButton.AddKeyPicker = BaseAddons.__index.AddKeyPicker
 
             function SubButton:Destroy()
@@ -6008,6 +6457,14 @@ do
         else
             table.insert(Buttons, Button)
         end
+
+        Library:RegisterBind(Button, Button.Base, "B:" .. tostring(Info.Idx or Info.Text), Button.Text, function()
+            if Button.Disabled or Button.Destroyed then
+                return
+            end
+
+            Library:SafeCallback(Button.Func)
+        end)
 
         Button.AddKeyPicker = BaseAddons.__index.AddKeyPicker
 
@@ -6264,6 +6721,10 @@ do
         Toggle.Default = Toggle.Value
 
         Toggles[Idx] = Toggle
+
+        Library:RegisterBind(Toggle, Button, "T:" .. tostring(Idx), Toggle.Text, function()
+            Toggle:SetValue(not Toggle.Value)
+        end)
 
         function Toggle:Destroy()
             Toggle.Destroyed = true
@@ -6536,6 +6997,10 @@ do
         Toggle.Default = Toggle.Value
 
         Toggles[Idx] = Toggle
+
+        Library:RegisterBind(Toggle, Button, "T:" .. tostring(Idx), Toggle.Text, function()
+            Toggle:SetValue(not Toggle.Value)
+        end)
 
         function Toggle:Destroy()
             Toggle.Destroyed = true
@@ -13549,6 +14014,7 @@ function Library:Unload()
     table.clear(Library.Dialogues)
     table.clear(Library.DraggableElements)
     table.clear(Library.KeybindToggles)
+    table.clear(Library.BindElements)
     table.clear(Library.DependencyBoxes)
 
     table.clear(TransparencyCache)
@@ -13559,6 +14025,8 @@ function Library:Unload()
     Library.WindowContainer = nil
     Library.KeybindFrame = nil
     Library.KeybindContainer = nil
+    Library.BindListening = nil
+    Library.BindConnection = nil
 
     getgenv().Library = nil
 end
