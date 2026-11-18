@@ -1724,6 +1724,1436 @@ function Library:GetTextBounds(Text: string, Font: Font, Size: number, Width: nu
     return Bounds.X, Bounds.Y
 end
 
+
+--// Menus deroulants : ecart avec leur bouton et retrait lateral (px) \\--
+Library.MenuGap = 6 --// base : le menu est decale vers le bas / cote de N px (plus colle au bouton)
+Library.MenuInset = 6 --// base : dropdown : le menu est plus etroit de N px de chaque cote
+
+--// Ces valeurs s'adaptent au Corner Radius : plus les coins sont ronds, plus le menu s'ecarte et se retrecit,
+--// pour que le haut du menu ne "colle" jamais au bouton (pas de raccord bizarre entre deux courbes).
+function Library:GetMenuGap()
+    return Library.MenuGap + math.floor(Library.CornerRadius / 4)
+end
+
+function Library:GetMenuInset()
+    return Library.MenuInset + math.floor(Library.CornerRadius / 3)
+end
+
+--// Smooth Text : lettres fluides, curseur en fondu, selection bleue fluide \\--
+-- Le TextBox natif de Roblox ne peut pas etre anime (texte, curseur et selection sont dessines par le moteur).
+-- On garde donc le TextBox natif pour la saisie (focus, clavier, souris, copier/coller...) mais on cache son rendu
+-- et on dessine a la place notre propre texte lettre par lettre, notre curseur et notre selection.
+Library.SmoothText = {
+    Enabled = true, --// false = TextBox natifs (aucune animation)
+
+    --// Apparition / disparition des lettres
+    SlowFade = 0.22, --// duree du fondu d'une lettre quand on ecrit lentement (secondes)
+    FastFade = 0.07, --// duree du fondu quand on ecrit vite
+    SlowCPS = 3, --// en dessous de ce nb de lettres/seconde : vitesse "lente"
+    FastCPS = 12, --// au dessus : vitesse "rapide"
+    MoveSlow = 22, --// vitesse a laquelle les lettres glissent vers leur place (lent)
+    MoveFast = 50, --// idem (rapide)
+    RiseOffset = 3, --// la lettre monte de N pixels en apparaissant (0 = fondu pur)
+    MaxAnimatedChars = 300, --// au dela, pas d'animation (perf)
+
+    --// Curseur
+    CaretWidth = 1,
+    CaretFade = 0.15, --// fondu quand le curseur apparait / disparait (focus)
+    CaretHold = 0.5, --// le curseur reste plein N secondes apres une frappe
+    CaretPeriod = 1.1, --// duree d'un clignotement complet (en fondu)
+
+    --// Selection
+    SelectionColor = Color3.fromRGB(45, 115, 255),
+    SelectionTransparency = 0.5,
+    SelectionFade = 0.12,
+}
+Library.SmoothTextBoxes = {}
+
+do
+    local Boxes = Library.SmoothTextBoxes
+    local Caches = {}
+    local LoopStarted = false
+
+    --// Utils \\--
+    local function Lerp(A: number, B: number, T: number): number
+        return A + (B - A) * T
+    end
+
+    local function Approach(Value: number, Target: number, MaxStep: number): number
+        if math.abs(Target - Value) <= MaxStep then
+            return Target
+        end
+
+        return Value + (Target > Value and MaxStep or -MaxStep)
+    end
+
+    local function IsShown(Box: GuiObject): boolean
+        local Current: any = Box
+        while Current and typeof(Current) == "Instance" and Current:IsA("GuiObject") do
+            if not Current.Visible then
+                return false
+            end
+
+            Current = Current.Parent
+        end
+
+        return true
+    end
+
+    local function IsGlyph(Ch: string): boolean
+        return Ch ~= " " and Ch ~= "\t" and Ch ~= "\n" and Ch ~= "\r"
+    end
+
+    local function SplitChars(Text: string)
+        local Out = {}
+        local Ok = pcall(function()
+            for _, Code in utf8.codes(Text) do
+                Out[#Out + 1] = utf8.char(Code)
+            end
+        end)
+
+        if not Ok then
+            Out = {}
+            for Index = 1, #Text do
+                Out[Index] = Text:sub(Index, Index)
+            end
+        end
+
+        return Out
+    end
+
+    --// CursorPosition / SelectionStart sont en octets : on les convertit en index de caractere (1 = avant la 1ere lettre)
+    local function ByteToChar(Text: string, BytePos: number): number
+        local Ok, Len = pcall(utf8.len, Text, 1, math.max(BytePos - 1, 0))
+        if Ok and Len then
+            return Len + 1
+        end
+
+        return BytePos
+    end
+
+    --// Mesure \\--
+    local function Measure(Text: string, Font: Font, Size: number)
+        local Params = Instance.new("GetTextBoundsParams")
+        Params.Text = Text
+        Params.RichText = false
+        Params.Font = Font
+        Params.Size = Size
+        Params.Width = 100000
+
+        local Ok, Bounds = pcall(TextService.GetTextBoundsAsync, TextService, Params)
+        if Ok and Bounds then
+            return Bounds.X, Bounds.Y
+        end
+
+        return nil, nil
+    end
+
+    local function GetCache(Font: Font, Size: number)
+        local Key = Font.Family .. "|" .. tostring(Font.Weight.Value) .. "|" .. tostring(Font.Style.Value) .. "|" .. tostring(Size)
+
+        local Cache = Caches[Key]
+        if Cache then
+            return Cache
+        end
+
+        local PipeWidth, LineHeight = Measure("||", Font, Size)
+        Cache = Caches[Key]
+        if Cache then
+            return Cache
+        end
+
+        Cache = {
+            Font = Font,
+            Size = Size,
+            Widths = {},
+            Pipes = PipeWidth or (Size * 0.4),
+            LineH = LineHeight or (Size * 1.2),
+            Primed = false,
+        }
+        Caches[Key] = Cache
+
+        return Cache
+    end
+
+    local function CharWidth(Cache, Ch: string): number
+        local Width = Cache.Widths[Ch]
+        if Width then
+            return Width
+        end
+
+        if Ch == "\n" or Ch == "\r" then
+            Width = 0
+        elseif Ch == "\t" then
+            Width = CharWidth(Cache, " ") * 4
+        else
+            -- les "|" evitent que les espaces soient ignores par la mesure
+            local Raw = Measure("|" .. Ch .. "|", Cache.Font, Cache.Size)
+            Width = Raw and math.max(Raw - Cache.Pipes, 0) or (Cache.Size * 0.5)
+        end
+
+        Cache.Widths[Ch] = Width
+        return Width
+    end
+
+    local function Prime(Cache)
+        if Cache.Primed then
+            return
+        end
+        Cache.Primed = true
+
+        task.spawn(function()
+            for Code = 32, 126 do
+                CharWidth(Cache, string.char(Code))
+            end
+        end)
+    end
+
+    --// Labels de lettres (pool) \\--
+    local function AcquireLabel(S, Ch: string, Width: number)
+        local Label = table.remove(S.Pool)
+
+        if not Label then
+            Label = Instance.new("TextLabel")
+            Label.Name = "Char"
+            Label.BackgroundTransparency = 1
+            Label.BorderSizePixel = 0
+            Label.RichText = false
+            Label.TextWrapped = false
+            Label.TextXAlignment = Enum.TextXAlignment.Left
+            Label.TextYAlignment = Enum.TextYAlignment.Center
+            Label.Interactable = false
+            Label.AutoLocalize = false
+            Label.ZIndex = 2
+
+            if S.StrokeSrc then
+                local Stroke = Instance.new("UIStroke")
+                Stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+                Stroke.Parent = Label
+            end
+        end
+
+        Label.Text = Ch
+        Label.FontFace = S.Cache.Font
+        Label.TextSize = S.Cache.Size
+        Label.TextColor3 = S.Box.TextColor3
+        Label.Size = UDim2.fromOffset(Width + 6, S.LineH)
+        Label.TextTransparency = 1
+        Label.Visible = false
+        Label.Parent = S.Content
+
+        local Stroke = Label:FindFirstChildOfClass("UIStroke")
+        if Stroke and S.StrokeSrc then
+            Stroke.Color = S.StrokeSrc.Color
+            Stroke.Thickness = S.StrokeSrc.Thickness
+            Stroke.LineJoinMode = S.StrokeSrc.LineJoinMode
+            Stroke.Transparency = 1
+        end
+
+        return Label
+    end
+
+    local function ReleaseLabel(S, Label: TextLabel)
+        Label.Visible = false
+        table.insert(S.Pool, Label)
+    end
+
+    local function SetLabelAlpha(S, Label: TextLabel, Alpha: number)
+        Label.TextTransparency = 1 - Alpha * (1 - S.BaseT)
+
+        local Stroke = Label:FindFirstChildOfClass("UIStroke")
+        if Stroke and S.StrokeSrc then
+            Stroke.Transparency = 1 - Alpha * (1 - S.StrokeBaseT)
+        end
+    end
+
+    --// Fallback : si quelque chose plante, on rend le TextBox natif (la library reste utilisable) \\--
+    local function Fallback(S, Err)
+        if S.Broken then
+            return
+        end
+        S.Broken = true
+        warn("[Library.SmoothText] desactive pour un TextBox :", Err)
+
+        Boxes[S.Box] = nil
+
+        if S.Overlay then
+            S.Overlay.Visible = false
+        end
+        if S.Cover then
+            S.Cover.Visible = false
+        end
+
+        pcall(function()
+            S.Box.TextTransparency = S.BaseT
+            S.Box.PlaceholderText = S.PlaceholderStore
+            if S.StrokeSrc then
+                S.StrokeSrc.Enabled = true
+            end
+        end)
+    end
+
+    --// Mise en page (retour a la ligne, alignement) \\--
+    local function Relayout(S, Snap: boolean?): boolean
+        local Box, Cache = S.Box, S.Cache
+        if not Cache then
+            return false
+        end
+
+        local Scale = Library.DPIScale
+        if not Scale or Scale <= 0 then
+            Scale = 1
+        end
+
+        local Abs = Box.AbsoluteSize
+        local BoxW, BoxH = Abs.X / Scale, Abs.Y / Scale
+
+        local Pad = Box:FindFirstChildOfClass("UIPadding")
+        local PadL, PadR, PadT, PadB = 0, 0, 0, 0
+        if Pad then
+            PadL = Pad.PaddingLeft.Offset + Pad.PaddingLeft.Scale * BoxW
+            PadR = Pad.PaddingRight.Offset + Pad.PaddingRight.Scale * BoxW
+            PadT = Pad.PaddingTop.Offset + Pad.PaddingTop.Scale * BoxH
+            PadB = Pad.PaddingBottom.Offset + Pad.PaddingBottom.Scale * BoxH
+        end
+
+        local ViewW, ViewH = BoxW - PadL - PadR, BoxH - PadT - PadB
+        if ViewW <= 0 or ViewH <= 0 then
+            S.Pending = true
+            return false
+        end
+        S.Pending = false
+        S.ViewW, S.ViewH = ViewW, ViewH
+
+        if S.Cover then
+            S.Cover.Position = UDim2.fromOffset(-PadL, -PadT)
+            S.Cover.Size = UDim2.new(1, PadL + PadR, 1, PadT + PadB)
+        end
+
+        local LineH = Cache.LineH * math.max(Box.LineHeight, 0.1)
+        if LineH ~= S.LineH then
+            S.LineH = LineH
+            for _, C in S.Chars do
+                if C.Label then
+                    C.Label.Size = UDim2.fromOffset(C.W + 6, LineH)
+                end
+            end
+        end
+
+        local Chars = S.Chars
+        local Count = #Chars
+        local MaxW = Box.TextWrapped and (ViewW + 1) or nil
+
+        local Lines = {}
+        local Line = { First = 1, Last = 0, VisW = 0, EndX = 0 }
+        Lines[1] = Line
+
+        local X = 0
+        local AtWordStart = true
+
+        local function NewLine(LastIndex: number)
+            Line.Last = LastIndex
+            Line.EndX = X
+            Line = { First = LastIndex + 1, Last = 0, VisW = 0, EndX = 0 }
+            Lines[#Lines + 1] = Line
+            X = 0
+        end
+
+        for Index = 1, Count do
+            local C = Chars[Index]
+            local Ch = C.Ch
+
+            if Ch == "\n" then
+                C.Line = #Lines
+                C.LX = X
+                NewLine(Index)
+                AtWordStart = true
+            elseif Ch == " " or Ch == "\t" or Ch == "\r" then
+                C.Line = #Lines
+                C.LX = X
+                X += C.W
+                AtWordStart = true
+            else
+                if AtWordStart then
+                    AtWordStart = false
+
+                    if MaxW and X > 0 then
+                        local WordW, J = 0, Index
+                        while J <= Count do
+                            local Cj = Chars[J].Ch
+                            if Cj == " " or Cj == "\t" or Cj == "\n" or Cj == "\r" then
+                                break
+                            end
+
+                            WordW += Chars[J].W
+                            J += 1
+                        end
+
+                        if X + WordW > MaxW and WordW <= MaxW then
+                            NewLine(Index - 1)
+                        end
+                    end
+                end
+
+                -- mot plus long que la ligne : on coupe au milieu
+                if MaxW and X > 0 and X + C.W > MaxW then
+                    NewLine(Index - 1)
+                end
+
+                C.Line = #Lines
+                C.LX = X
+                X += C.W
+                Line.VisW = X
+            end
+        end
+        Line.Last = Count
+        Line.EndX = X
+
+        local XAlign, YAlign = Box.TextXAlignment, Box.TextYAlignment
+        local TotalW = 0
+        for Index, Ln in Lines do
+            Ln.Y = (Index - 1) * LineH
+
+            local Off = 0
+            if XAlign == Enum.TextXAlignment.Center then
+                Off = math.max((ViewW - Ln.VisW) / 2, 0)
+            elseif XAlign == Enum.TextXAlignment.Right then
+                Off = math.max(ViewW - Ln.VisW, 0)
+            end
+            Ln.Off = Off
+
+            TotalW = math.max(TotalW, Ln.EndX)
+        end
+
+        local TotalH = #Lines * LineH
+        local BaseY = 0
+        if TotalH < ViewH then
+            if YAlign == Enum.TextYAlignment.Center then
+                BaseY = (ViewH - TotalH) / 2
+            elseif YAlign == Enum.TextYAlignment.Bottom then
+                BaseY = ViewH - TotalH
+            end
+        end
+
+        for Index = 1, Count do
+            local C = Chars[Index]
+            local Ln = Lines[C.Line]
+
+            C.TX = C.LX + Ln.Off
+            C.TY = Ln.Y
+
+            if Snap or not C.Placed then
+                C.X, C.Y = C.TX, C.TY
+            end
+
+            if not C.Placed then
+                C.Placed = true
+                if C.Label then
+                    C.Label.Visible = true
+                end
+            end
+
+            C.NeedsWrite = true
+        end
+
+        S.Lines = Lines
+        S.TotalW, S.TotalH, S.BaseY = TotalW, TotalH, BaseY
+        S.LayoutVersion += 1
+        S.Animating = true
+
+        return true
+    end
+
+    --// Synchronisation du texte (diff -> lettres qui apparaissent / disparaissent) \\--
+    local function SyncText(S, ForceSnap: boolean?)
+        if S.Dead or S.Broken then
+            return
+        end
+
+        local Cfg = Library.SmoothText
+        local Box = S.Box
+
+        S.Token += 1
+        local Token = S.Token
+
+        local Cache = GetCache(Box.FontFace, Box.TextSize)
+        if Token ~= S.Token or S.Dead then
+            return
+        end
+
+        local Text = Box.Text
+        local NewList = SplitChars(Text)
+
+        -- les mesures peuvent attendre (1ere fois qu'on voit un caractere) : on les fait avant de toucher a l'etat
+        for _, Ch in NewList do
+            CharWidth(Cache, Ch)
+        end
+        if S.Cache ~= Cache then
+            for _, C in S.Chars do
+                CharWidth(Cache, C.Ch)
+            end
+        end
+        if Token ~= S.Token or S.Dead then
+            return
+        end
+
+        Prime(Cache)
+
+        local MetricsChanged = S.Cache ~= Cache
+        if MetricsChanged then
+            S.Cache = Cache
+            S.LineH = Cache.LineH * math.max(Box.LineHeight, 0.1)
+
+            for _, C in S.Chars do
+                C.W = CharWidth(Cache, C.Ch)
+
+                if C.Label then
+                    C.Label.FontFace = Cache.Font
+                    C.Label.TextSize = Cache.Size
+                    C.Label.Size = UDim2.fromOffset(C.W + 6, S.LineH)
+                end
+            end
+
+            S.Placeholder.FontFace = Cache.Font
+            S.Placeholder.TextSize = Cache.Size
+        end
+
+        local Now = os.clock()
+        local Old = S.Chars
+        local OldCount, NewCount = #Old, #NewList
+
+        local Prefix = 0
+        while Prefix < OldCount and Prefix < NewCount and Old[Prefix + 1].Ch == NewList[Prefix + 1] do
+            Prefix += 1
+        end
+
+        local Suffix = 0
+        while
+            Suffix < OldCount - Prefix
+            and Suffix < NewCount - Prefix
+            and Old[OldCount - Suffix].Ch == NewList[NewCount - Suffix]
+        do
+            Suffix += 1
+        end
+
+        local Removed = OldCount - Prefix - Suffix
+        local Added = NewCount - Prefix - Suffix
+
+        if Removed == 0 and Added == 0 then
+            S.ShownText = Text
+            S.Synced = true
+            Relayout(S, ForceSnap)
+            return
+        end
+
+        local Focused = Box:IsFocused()
+        local Snap = ForceSnap
+            or not S.Synced
+            or not IsShown(Box)
+            or (Removed + Added) > Cfg.MaxAnimatedChars
+            -- texte modifie par le script en continu (ex : valeur d'un colorpicker qu'on fait glisser) : pas d'animation
+            or (not Focused and S.ChangeGap < 0.3)
+
+        -- plus on ecrit vite, plus c'est rapide (toujours aussi fluide)
+        local Speed = math.clamp((S.Rate - Cfg.SlowCPS) / math.max(Cfg.FastCPS - Cfg.SlowCPS, 0.01), 0, 1)
+        if Added > 3 then
+            Speed = 1
+        end
+        local Dur = Lerp(Cfg.SlowFade, Cfg.FastFade, Speed)
+        S.MoveK = Lerp(Cfg.MoveSlow, Cfg.MoveFast, Speed)
+
+        local Built = {}
+        for Index = 1, Prefix do
+            Built[Index] = Old[Index]
+        end
+
+        -- lettres supprimees : elles se fondent sur place
+        for Index = Prefix + 1, OldCount - Suffix do
+            local C = Old[Index]
+
+            if C.Label then
+                if Snap or not C.Placed then
+                    ReleaseLabel(S, C.Label)
+                else
+                    table.insert(S.Ghosts, {
+                        Label = C.Label,
+                        X = C.X,
+                        Y = C.Y,
+                        A0 = C.A or 1,
+                        Start = Now,
+                        Dur = Dur,
+                    })
+                end
+            end
+        end
+
+        -- lettres ajoutees : elles apparaissent (en cascade rapide si c'est un collage)
+        local Stagger = (Added > 3) and (math.min(0.2, Added * 0.012) / Added) or 0
+        for K = 1, Added do
+            local Ch = NewList[Prefix + K]
+            local Width = CharWidth(Cache, Ch)
+
+            local C = {
+                Ch = Ch,
+                W = Width,
+                X = 0,
+                Y = 0,
+                TX = 0,
+                TY = 0,
+                LX = 0,
+                Line = 1,
+                Placed = false,
+                NeedsWrite = true,
+                A = 0,
+                Done = false,
+            }
+
+            if IsGlyph(Ch) then
+                C.Label = AcquireLabel(S, Ch, Width)
+            end
+
+            if Snap then
+                C.Start, C.Dur = -1e9, 0.001
+            else
+                C.Start, C.Dur = Now + (K - 1) * Stagger, Dur
+            end
+
+            Built[Prefix + K] = C
+        end
+
+        for K = 1, Suffix do
+            Built[Prefix + Added + K] = Old[OldCount - Suffix + K]
+        end
+
+        S.Chars = Built
+        S.ShownText = Text
+        S.Synced = true
+        S.LastActivity = Now
+
+        Relayout(S, Snap)
+    end
+
+    local function SafeSync(S, ForceSnap: boolean?)
+        local Ok, Err = pcall(SyncText, S, ForceSnap)
+        if not Ok then
+            Fallback(S, Err)
+        end
+    end
+
+    --// Frame par frame \\--
+    local function CaretPoint(S, CI: number): (number, number)
+        local Count = #S.Chars
+
+        if CI <= Count then
+            local C = S.Chars[CI]
+            return C.TX, C.TY
+        end
+
+        local Ln = S.Lines[#S.Lines]
+        return Ln.EndX + Ln.Off, Ln.Y
+    end
+
+    local function Step(S, Dt: number, Now: number)
+        local Box = S.Box
+        local Cfg = Library.SmoothText
+
+        if not Box.Parent then
+            return
+        end
+
+        local Focused = Box:IsFocused()
+
+        if S.Pending and S.Cache then
+            Relayout(S, true)
+        end
+
+        -- le cache suit le rayon des coins du TextBox
+        if S.Cover then
+            local Corner = S.CornerSrc
+            if not Corner then
+                Corner = Box:FindFirstChildOfClass("UICorner")
+                S.CornerSrc = Corner
+            end
+            if Corner and S.CoverCorner.CornerRadius ~= Corner.CornerRadius then
+                S.CoverCorner.CornerRadius = Corner.CornerRadius
+            end
+        end
+
+        if S.ColorsDirty then
+            S.ColorsDirty = false
+
+            for _, C in S.Chars do
+                if C.Label then
+                    C.Label.TextColor3 = Box.TextColor3
+                    local Stroke = C.Label:FindFirstChildOfClass("UIStroke")
+                    if Stroke and S.StrokeSrc then
+                        Stroke.Color = S.StrokeSrc.Color
+                    end
+                end
+            end
+            for _, G in S.Ghosts do
+                G.Label.TextColor3 = Box.TextColor3
+            end
+
+            S.Caret.BackgroundColor3 = Box.TextColor3
+            S.Placeholder.TextColor3 = Box.PlaceholderColor3
+        end
+
+        local Busy = Focused
+            or S.Animating
+            or S.CaretMaster > 0
+            or S.SelBusy
+            or S.PhDirty
+            or S.ScrollBusy
+        if not Busy then
+            return
+        end
+
+        --// Lettres \\--
+        if S.Animating then
+            local Still = false
+            local Kp = 1 - math.exp(-Dt * S.MoveK)
+
+            for _, C in S.Chars do
+                if C.Placed then
+                    local Dx, Dy = C.TX - C.X, C.TY - C.Y
+                    local Moving = math.abs(Dx) > 0.05 or math.abs(Dy) > 0.05
+
+                    if Moving then
+                        C.X += Dx * Kp
+                        C.Y += Dy * Kp
+                    else
+                        C.X, C.Y = C.TX, C.TY
+                    end
+
+                    local P = (Now - C.Start) / C.Dur
+                    local Fading = P < 1
+                    local Rise = 0
+
+                    if Fading then
+                        P = math.max(P, 0)
+                        local Ease = 1 - (1 - P) ^ 3
+                        C.A = Ease
+                        Rise = Cfg.RiseOffset * (1 - Ease)
+                    else
+                        C.A = 1
+                    end
+
+                    if Moving or Fading then
+                        Still = true
+                    end
+
+                    if C.NeedsWrite or Moving or Fading then
+                        if C.Label then
+                            C.Label.Position = UDim2.fromOffset(C.X, C.Y + Rise)
+                            SetLabelAlpha(S, C.Label, C.A)
+                        end
+
+                        C.NeedsWrite = Moving or Fading
+                    end
+                end
+            end
+
+            local Index = 1
+            while Index <= #S.Ghosts do
+                local G = S.Ghosts[Index]
+                local P = (Now - G.Start) / G.Dur
+
+                if P >= 1 then
+                    ReleaseLabel(S, G.Label)
+                    table.remove(S.Ghosts, Index)
+                else
+                    local Remain = 1 - math.max(P, 0)
+                    G.Label.Position = UDim2.fromOffset(G.X, G.Y)
+                    SetLabelAlpha(S, G.Label, G.A0 * Remain * Remain)
+                    Still = true
+                    Index += 1
+                end
+            end
+
+            S.Animating = Still
+        end
+
+        --// Placeholder (fondu) \\--
+        local PhTarget = (Box.Text == "") and 1 or 0
+        if S.PhA ~= PhTarget or S.PhDirty then
+            S.PhA = Approach(S.PhA, PhTarget, Dt / 0.15)
+            S.PhDirty = S.PhA ~= PhTarget
+            S.Placeholder.TextTransparency = 1 - S.PhA * (1 - S.BaseT)
+            S.Placeholder.Visible = S.PhA > 0
+        end
+
+        --// Curseur + selection \\--
+        local Count = #S.Chars
+        local Text = Box.Text
+        local Cursor = Box.CursorPosition
+        local HasCaret = Focused and Cursor ~= -1
+        local Ready = S.Synced and S.ShownText == Text and not S.Pending and S.Lines ~= nil
+
+        local CI = nil
+        if HasCaret and Ready then
+            CI = math.clamp(ByteToChar(Text, Cursor), 1, Count + 1)
+
+            if CI ~= S.LastCI then
+                S.LastCI = CI
+                S.LastActivity = Now
+                S.CaretDirty = true
+            end
+            if S.LayoutVersion ~= S.CaretLayoutV then
+                S.CaretLayoutV = S.LayoutVersion
+                S.CaretDirty = true
+            end
+
+            if S.CaretDirty then
+                S.CaretDirty = false
+                S.CaretTX, S.CaretTY = CaretPoint(S, CI)
+                S.HasCaretTarget = true
+            end
+
+            if S.CaretMaster == 0 then
+                S.CX, S.CY = S.CaretTX, S.CaretTY
+            end
+        end
+
+        S.CaretMaster = Approach(S.CaretMaster, HasCaret and 1 or 0, Dt / math.max(Cfg.CaretFade, 0.01))
+
+        if S.CaretMaster > 0 then
+            local Idle = Now - S.LastActivity
+            local Blink = 1
+
+            if Idle > Cfg.CaretHold then
+                local Phase = ((Idle - Cfg.CaretHold) % Cfg.CaretPeriod) / Cfg.CaretPeriod
+                Blink = math.clamp((0.5 + 0.5 * math.cos(Phase * math.pi * 2)) * 1.6 - 0.15, 0, 1)
+            end
+
+            local Kp = 1 - math.exp(-Dt * math.max(S.MoveK * 1.3, 30))
+            S.CX += (S.CaretTX - S.CX) * Kp
+            S.CY += (S.CaretTY - S.CY) * Kp
+
+            local CaretH = math.max(S.LineH - 2, 8)
+            S.Caret.Size = UDim2.fromOffset(Cfg.CaretWidth, CaretH)
+            S.Caret.Position = UDim2.fromOffset(S.CX, S.CY + (S.LineH - CaretH) / 2)
+            S.Caret.BackgroundTransparency = 1 - S.CaretMaster * Blink
+            S.Caret.Visible = true
+        elseif S.Caret.Visible then
+            S.Caret.Visible = false
+        end
+
+        --// Selection \\--
+        if not HasCaret then
+            S.SelTargets = {}
+            S.SelA, S.SelB = nil, nil
+        elseif CI then
+            local SelStart = Box.SelectionStart
+            local A, B = nil, nil
+
+            if SelStart ~= -1 and SelStart ~= Cursor then
+                local SI = math.clamp(ByteToChar(Text, SelStart), 1, Count + 1)
+                A, B = math.min(SI, CI), math.max(SI, CI)
+            end
+
+            if A ~= S.SelA or B ~= S.SelB or S.SelV ~= S.LayoutVersion then
+                S.SelA, S.SelB, S.SelV = A, B, S.LayoutVersion
+                S.SelTargets = {}
+
+                if A and B and A < B then
+                    for Index, Ln in S.Lines do
+                        local FirstC, LastC = math.max(Ln.First, A), math.min(Ln.Last, B - 1)
+
+                        if FirstC <= LastC then
+                            local C1, C2 = S.Chars[FirstC], S.Chars[LastC]
+                            local X1 = C1.TX
+                            local X2 = C2.TX + C2.W
+                            if C2.Ch == "\n" then
+                                X2 += 4
+                            end
+
+                            S.SelTargets[Index] = { X1, math.max(X2 - X1, 0), Ln.Y }
+                        end
+                    end
+                end
+            end
+        end
+
+        local AnySel = false
+        for Index, T in S.SelTargets do
+            if not S.SelRects[Index] then
+                local Frame = Instance.new("Frame")
+                Frame.Name = "Selection"
+                Frame.BorderSizePixel = 0
+                Frame.Interactable = false
+                Frame.ZIndex = 1
+                Frame.Visible = false
+                Frame.BackgroundTransparency = 1
+                Frame.Parent = S.Content
+
+                local Corner = Instance.new("UICorner")
+                Corner.CornerRadius = UDim.new(0, 2)
+                Corner.Parent = Frame
+
+                S.SelRects[Index] = { Frame = Frame, X = T[1], Y = T[3], W = 0, A = 0, Target = 0 }
+            end
+        end
+
+        local SelKp = 1 - math.exp(-Dt * 35)
+        for Index, R in S.SelRects do
+            local T = S.SelTargets[Index]
+
+            if T then
+                if R.A == 0 then
+                    R.X, R.Y, R.W = T[1], T[3], 0 -- la selection "pousse" depuis son debut
+                end
+
+                R.Target = 1
+                R.X += (T[1] - R.X) * SelKp
+                R.Y += (T[3] - R.Y) * SelKp
+                R.W += (T[2] - R.W) * SelKp
+            else
+                R.Target = 0
+            end
+
+            R.A = Approach(R.A, R.Target, Dt / math.max(Cfg.SelectionFade, 0.01))
+
+            if R.A > 0 then
+                AnySel = true
+                R.Frame.Visible = true
+                R.Frame.BackgroundColor3 = Cfg.SelectionColor
+                R.Frame.Position = UDim2.fromOffset(R.X, R.Y)
+                R.Frame.Size = UDim2.fromOffset(R.W, S.LineH)
+                R.Frame.BackgroundTransparency = 1 - R.A * (1 - Cfg.SelectionTransparency)
+            elseif R.Frame.Visible then
+                R.Frame.Visible = false
+            end
+        end
+        S.SelBusy = AnySel
+
+        --// Defilement (texte plus long que la boite) \\--
+        if S.Lines then
+            local TX, TY = S.ScrollTX, S.ScrollTY
+
+            if Focused and S.HasCaretTarget then
+                if not Box.TextWrapped and S.TotalW > S.ViewW then
+                    if S.CaretTX - TX > S.ViewW - 1 then
+                        TX = S.CaretTX - S.ViewW + 1
+                    elseif S.CaretTX - TX < 0 then
+                        TX = S.CaretTX
+                    end
+                    TX = math.clamp(TX, 0, S.TotalW - S.ViewW + 1)
+                else
+                    TX = 0
+                end
+
+                if S.TotalH > S.ViewH then
+                    local Top = S.CaretTY
+                    local Bottom = Top + S.LineH
+
+                    if Top < TY then
+                        TY = Top
+                    elseif Bottom > TY + S.ViewH then
+                        TY = Bottom - S.ViewH
+                    end
+                    TY = math.clamp(TY, 0, S.TotalH - S.ViewH)
+                else
+                    TY = 0
+                end
+            elseif not Focused then
+                TX, TY = 0, 0
+            end
+
+            S.ScrollTX, S.ScrollTY = TX, TY
+
+            local ScrollKp = 1 - math.exp(-Dt * 30)
+            S.ScrollX += (TX - S.ScrollX) * ScrollKp
+            S.ScrollY += (TY - S.ScrollY) * ScrollKp
+
+            if math.abs(TX - S.ScrollX) < 0.05 then
+                S.ScrollX = TX
+            end
+            if math.abs(TY - S.ScrollY) < 0.05 then
+                S.ScrollY = TY
+            end
+
+            S.ScrollBusy = S.ScrollX ~= TX or S.ScrollY ~= TY
+
+            local PosX, PosY = -S.ScrollX, S.BaseY - S.ScrollY
+            if PosX ~= S.LastPosX or PosY ~= S.LastPosY then
+                S.LastPosX, S.LastPosY = PosX, PosY
+                S.Content.Position = UDim2.fromOffset(PosX, PosY)
+            end
+        end
+    end
+
+    local function StartLoop()
+        if LoopStarted then
+            return
+        end
+        LoopStarted = true
+
+        Library:GiveSignal(RunService.RenderStepped:Connect(function(Dt)
+            local Now = os.clock()
+
+            for _, S in Boxes do
+                local Ok, Err = pcall(Step, S, Dt, Now)
+                if not Ok then
+                    Fallback(S, Err)
+                end
+            end
+        end))
+    end
+
+    --// Attacher le systeme a un TextBox \\--
+    function Library:SmoothTextBox(Box: TextBox)
+        local Cfg = Library.SmoothText
+        if not Cfg.Enabled or typeof(Box) ~= "Instance" or not Box:IsA("TextBox") then
+            return nil
+        end
+        if Boxes[Box] then
+            return Boxes[Box]
+        end
+
+        -- TextScaled change la taille du texte en permanence : incompatible avec des lettres animees
+        if Box.TextScaled then
+            Box.TextScaled = false
+            Box.TextSize = 14
+        end
+
+        local S = {
+            Box = Box,
+
+            Chars = {},
+            Ghosts = {},
+            Pool = {},
+            Lines = nil,
+            Cache = nil,
+
+            Token = 0,
+            Synced = false,
+            ShownText = "",
+            Pending = false,
+            Animating = false,
+            LayoutVersion = 0,
+
+            LineH = 14,
+            ViewW = 0,
+            ViewH = 0,
+            TotalW = 0,
+            TotalH = 0,
+            BaseY = 0,
+            BaseT = Box.TextTransparency,
+
+            Rate = 0,
+            MoveK = Cfg.MoveSlow,
+            LastTextChange = 0,
+            ChangeGap = 999,
+            LastActivity = os.clock(),
+
+            CaretMaster = 0,
+            CaretTX = 0,
+            CaretTY = 0,
+            CX = 0,
+            CY = 0,
+            CaretDirty = true,
+            CaretLayoutV = -1,
+            HasCaretTarget = false,
+            LastCI = nil,
+
+            SelRects = {},
+            SelTargets = {},
+            SelBusy = false,
+            SelV = -1,
+
+            ScrollX = 0,
+            ScrollY = 0,
+            ScrollTX = 0,
+            ScrollTY = 0,
+            ScrollBusy = false,
+
+            PhA = 0,
+            PhDirty = false,
+            ColorsDirty = false,
+            PlaceholderStore = Box.PlaceholderText,
+        }
+
+        --// Contour du texte (UIStroke "Contextual", ex : slider) : copie sur chaque lettre
+        for _, Child in Box:GetChildren() do
+            if Child:IsA("UIStroke") and Child.ApplyStrokeMode == Enum.ApplyStrokeMode.Contextual then
+                S.StrokeSrc = Child
+                S.StrokeBaseT = Child.Transparency
+                Child.Enabled = false
+                break
+            end
+        end
+        S.StrokeBaseT = S.StrokeBaseT or 0
+
+        --// Cache : masque le rendu natif (texte, curseur et selection du moteur) quand le fond est opaque
+        if Box.BackgroundTransparency < 0.5 then
+            local Cover = Instance.new("Frame")
+            Cover.Name = "SmoothCover"
+            Cover.BorderSizePixel = 0
+            Cover.BackgroundColor3 = Box.BackgroundColor3
+            Cover.BackgroundTransparency = Box.BackgroundTransparency
+            Cover.Interactable = false
+            Cover.ZIndex = 0
+            Cover.Parent = Box
+
+            local CoverCorner = Instance.new("UICorner")
+            CoverCorner.Parent = Cover
+
+            S.Cover = Cover
+            S.CoverCorner = CoverCorner
+            S.CornerSrc = Box:FindFirstChildOfClass("UICorner")
+            if S.CornerSrc then
+                CoverCorner.CornerRadius = S.CornerSrc.CornerRadius
+            end
+        end
+
+        local Overlay = Instance.new("Frame")
+        Overlay.Name = "SmoothText"
+        Overlay.BackgroundTransparency = 1
+        Overlay.BorderSizePixel = 0
+        Overlay.Size = UDim2.fromScale(1, 1)
+        Overlay.ClipsDescendants = true
+        Overlay.Interactable = false
+        Overlay.ZIndex = 0
+        Overlay.Parent = Box
+
+        local Content = Instance.new("Frame")
+        Content.Name = "Content"
+        Content.BackgroundTransparency = 1
+        Content.BorderSizePixel = 0
+        Content.Size = UDim2.fromScale(1, 1)
+        Content.Interactable = false
+        Content.ZIndex = 1
+        Content.Parent = Overlay
+
+        local Caret = Instance.new("Frame")
+        Caret.Name = "Caret"
+        Caret.BorderSizePixel = 0
+        Caret.BackgroundColor3 = Box.TextColor3
+        Caret.BackgroundTransparency = 1
+        Caret.Size = UDim2.fromOffset(Cfg.CaretWidth, 12)
+        Caret.Interactable = false
+        Caret.Visible = false
+        Caret.ZIndex = 3
+        Caret.Parent = Content
+
+        local Placeholder = Instance.new("TextLabel")
+        Placeholder.Name = "Placeholder"
+        Placeholder.BackgroundTransparency = 1
+        Placeholder.BorderSizePixel = 0
+        Placeholder.Size = UDim2.fromScale(1, 1)
+        Placeholder.RichText = false
+        Placeholder.TextTruncate = Enum.TextTruncate.AtEnd
+        Placeholder.Interactable = false
+        Placeholder.AutoLocalize = false
+        Placeholder.Text = Box.PlaceholderText
+        Placeholder.FontFace = Box.FontFace
+        Placeholder.TextSize = Box.TextSize
+        Placeholder.TextColor3 = Box.PlaceholderColor3
+        Placeholder.TextWrapped = Box.TextWrapped
+        Placeholder.TextXAlignment = Box.TextXAlignment
+        Placeholder.TextYAlignment = Box.TextYAlignment
+        Placeholder.TextTransparency = 1
+        Placeholder.Visible = false
+        Placeholder.ZIndex = 1
+        Placeholder.Parent = Overlay
+
+        S.Overlay, S.Content, S.Caret, S.Placeholder = Overlay, Content, Caret, Placeholder
+
+        -- le placeholder natif est remplace par le notre (qui apparait / disparait en fondu)
+        Box.PlaceholderText = ""
+        S.PhA = (Box.Text == "") and 1 or 0
+        Placeholder.TextTransparency = 1 - S.PhA * (1 - S.BaseT)
+        Placeholder.Visible = S.PhA > 0
+
+        -- le texte natif est cache (la library peut quand meme changer TextTransparency : on la lit puis on re-cache)
+        Box.TextTransparency = 1
+
+        Boxes[Box] = S
+        StartLoop()
+
+        --// Signaux \\--
+        Box:GetPropertyChangedSignal("Text"):Connect(function()
+            local Now = os.clock()
+            local Gap = Now - S.LastTextChange
+            S.LastTextChange = Now
+            S.ChangeGap = Gap
+
+            if Gap < 1 then
+                local Instant = 1 / math.max(Gap, 0.02)
+                S.Rate = (S.Rate * 0.5) + (Instant * 0.5)
+            else
+                S.Rate = 0
+            end
+
+            task.spawn(SafeSync, S, false)
+        end)
+
+        Box:GetPropertyChangedSignal("PlaceholderText"):Connect(function()
+            if Box.PlaceholderText ~= "" then
+                S.PlaceholderStore = Box.PlaceholderText
+                Placeholder.Text = Box.PlaceholderText
+                Box.PlaceholderText = ""
+            end
+        end)
+
+        Box:GetPropertyChangedSignal("TextTransparency"):Connect(function()
+            local Value = Box.TextTransparency
+            if Value ~= 1 then
+                S.BaseT = Value
+                Box.TextTransparency = 1
+
+                for _, C in S.Chars do
+                    C.NeedsWrite = true
+                end
+                S.Animating = true
+                S.PhDirty = true
+            end
+        end)
+
+        local function MarkColors()
+            S.ColorsDirty = true
+        end
+        Box:GetPropertyChangedSignal("TextColor3"):Connect(MarkColors)
+        Box:GetPropertyChangedSignal("PlaceholderColor3"):Connect(MarkColors)
+        if S.StrokeSrc then
+            S.StrokeSrc:GetPropertyChangedSignal("Color"):Connect(MarkColors)
+        end
+
+        if S.Cover then
+            Box:GetPropertyChangedSignal("BackgroundColor3"):Connect(function()
+                S.Cover.BackgroundColor3 = Box.BackgroundColor3
+            end)
+            Box:GetPropertyChangedSignal("BackgroundTransparency"):Connect(function()
+                S.Cover.BackgroundTransparency = Box.BackgroundTransparency
+            end)
+        end
+
+        local function Remeasure()
+            Placeholder.TextWrapped = Box.TextWrapped
+            Placeholder.TextXAlignment = Box.TextXAlignment
+            Placeholder.TextYAlignment = Box.TextYAlignment
+            task.spawn(SafeSync, S, true)
+        end
+        for _, Property in { "FontFace", "TextSize", "LineHeight", "TextWrapped", "TextXAlignment", "TextYAlignment" } do
+            Box:GetPropertyChangedSignal(Property):Connect(Remeasure)
+        end
+
+        local LastWidth = Box.AbsoluteSize.X
+        Box:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            if Box.AbsoluteSize.X ~= LastWidth or S.Pending then
+                LastWidth = Box.AbsoluteSize.X
+                Relayout(S, false)
+            end
+        end)
+
+        Box.Focused:Connect(function()
+            S.LastActivity = os.clock()
+            S.CaretDirty = true
+        end)
+
+        Box.Destroying:Connect(function()
+            S.Dead = true
+            Boxes[Box] = nil
+        end)
+
+        task.spawn(SafeSync, S, true)
+
+        return S
+    end
+end
+
+
+--// Masquer / afficher tous les blocs de l'onglet actif, un par un \\--
+Library.BlocksAnimation = {
+    Step = 0.09, --// delai entre le debut de l'animation de deux blocs (secondes)
+    Duration = 0.3, --// duree de l'animation d'un bloc
+}
+
+do
+    local function CollectFade(Holder: GuiObject)
+        local Props = {}
+
+        for _, Desc in Holder:GetDescendants() do
+            if Desc:IsA("GuiObject") then
+                if Desc.BackgroundTransparency < 1 then
+                    table.insert(Props, { Desc, "BackgroundTransparency", Desc.BackgroundTransparency })
+                end
+
+                if Desc:IsA("TextLabel") or Desc:IsA("TextButton") or Desc:IsA("TextBox") then
+                    if Desc.TextTransparency < 1 then
+                        table.insert(Props, { Desc, "TextTransparency", Desc.TextTransparency })
+                    end
+                elseif Desc:IsA("ImageLabel") or Desc:IsA("ImageButton") then
+                    if Desc.ImageTransparency < 1 then
+                        table.insert(Props, { Desc, "ImageTransparency", Desc.ImageTransparency })
+                    end
+                end
+            elseif Desc:IsA("UIStroke") then
+                if Desc.Transparency < 1 then
+                    table.insert(Props, { Desc, "Transparency", Desc.Transparency })
+                end
+            end
+        end
+
+        return Props
+    end
+
+    local function SetFade(Props, Hidden: number)
+        for _, Prop in Props do
+            if Prop[1].Parent then
+                Prop[1][Prop[2]] = Prop[3] + (1 - Prop[3]) * Hidden
+            end
+        end
+    end
+
+    -- Hidden : 0 = visible, 1 = cache (fondu + hauteur qui se referme)
+    local function RunBlock(Holder: GuiObject, Props, Hiding: boolean, Height: number, Duration: number)
+        local Start = os.clock()
+
+        while true do
+            local T = math.clamp((os.clock() - Start) / Duration, 0, 1)
+            local Ease = T * T * (3 - 2 * T)
+            local Hidden = Hiding and Ease or (1 - Ease)
+
+            SetFade(Props, Hidden)
+            Holder.Size = UDim2.new(1, 0, 0, Height * (1 - Hidden))
+
+            if T >= 1 then
+                break
+            end
+            RunService.RenderStepped:Wait()
+        end
+    end
+
+    local function RestoreLayout(Holder: GuiObject, Props)
+        SetFade(Props, 0)
+        Holder.AutomaticSize = Enum.AutomaticSize.Y
+        Holder.Size = UDim2.fromScale(1, 0)
+        Holder.ClipsDescendants = false
+    end
+
+    local function GetHolders(Tab)
+        local List = {}
+
+        for _, Box in Tab.Groupboxes do
+            if Box.BoxHolder and Box.BoxHolder.Visible then
+                table.insert(List, Box.BoxHolder)
+            end
+        end
+        for _, Box in Tab.Tabboxes do
+            if Box.BoxHolder and Box.BoxHolder.Visible then
+                table.insert(List, Box.BoxHolder)
+            end
+        end
+
+        -- ordre de lecture : de haut en bas, puis de gauche a droite
+        table.sort(List, function(A, B)
+            local PA, PB = A.AbsolutePosition, B.AbsolutePosition
+            if math.abs(PA.Y - PB.Y) > 4 then
+                return PA.Y < PB.Y
+            end
+
+            return PA.X < PB.X
+        end)
+
+        return List
+    end
+
+    function Library:SetBlocksHidden(Hidden: boolean, Tab)
+        Tab = Tab or Library.ActiveTab
+        if not Tab or Tab.BlocksBusy or Library.Unloaded then
+            return
+        end
+        if (Tab.BlocksHidden == true) == Hidden then
+            return
+        end
+
+        local Holders = Hidden and GetHolders(Tab) or (Tab.HiddenBlocks or {})
+        if #Holders == 0 then
+            return
+        end
+
+        local Cfg = Library.BlocksAnimation
+        Tab.BlocksBusy = true
+        Tab.BlocksHidden = Hidden
+        Tab.HiddenBlocks = Hidden and Holders or nil
+
+        local Remaining = #Holders
+
+        for Index, Holder in Holders do
+            task.spawn(function()
+                task.wait((Index - 1) * Cfg.Step)
+
+                if Holder.Parent and not Library.Unloaded then
+                    local Ok = pcall(function()
+                        Tab.BlockProps = Tab.BlockProps or {}
+                        local Props
+
+                        if Hidden then
+                            Props = CollectFade(Holder)
+                            Tab.BlockProps[Holder] = Props
+                        else
+                            Props = Tab.BlockProps[Holder] or CollectFade(Holder)
+                        end
+
+                        if Hidden then
+                            local Height = Holder.AbsoluteSize.Y / math.max(Library.DPIScale, 0.01)
+
+                            Holder.AutomaticSize = Enum.AutomaticSize.None
+                            Holder.Size = UDim2.new(1, 0, 0, Height)
+                            Holder.ClipsDescendants = true
+
+                            RunBlock(Holder, Props, true, Height, Cfg.Duration)
+
+                            Holder.Visible = false
+                            RestoreLayout(Holder, Props)
+                        else
+                            -- invisible d'abord, puis hauteur 0 : le bloc se deploie sans "flash"
+                            SetFade(Props, 1)
+                            Holder.AutomaticSize = Enum.AutomaticSize.None
+                            Holder.Size = UDim2.new(1, 0, 0, 0)
+                            Holder.ClipsDescendants = true
+                            Holder.Visible = true
+
+                            RunService.RenderStepped:Wait()
+
+                            local Layout = Holder:FindFirstChildOfClass("UIListLayout")
+                            local Height = (Layout and Layout.AbsoluteContentSize.Y or 0) / math.max(Library.DPIScale, 0.01) + 8
+
+                            RunBlock(Holder, Props, false, Height, Cfg.Duration)
+                            RestoreLayout(Holder, Props)
+                        end
+                    end)
+
+                    if not Ok then
+                        Holder.Visible = not Hidden
+                        Holder.AutomaticSize = Enum.AutomaticSize.Y
+                        Holder.Size = UDim2.fromScale(1, 0)
+                        Holder.ClipsDescendants = false
+                    end
+                end
+
+                if not Hidden and Tab.BlockProps then
+                    Tab.BlockProps[Holder] = nil
+                end
+
+                Remaining -= 1
+                if Remaining <= 0 then
+                    Tab.BlocksBusy = false
+                end
+            end)
+        end
+    end
+
+    function Library:ToggleBlocks(Tab)
+        Tab = Tab or Library.ActiveTab
+        if Tab then
+            Library:SetBlocksHidden(not (Tab.BlocksHidden == true), Tab)
+        end
+    end
+end
+
 function Library:MouseIsOverFrame(Frame: GuiObject, Mouse: Vector2): boolean
     local AbsPos, AbsSize = Frame.AbsolutePosition, Frame.AbsoluteSize
     return Mouse.X >= AbsPos.X
@@ -4331,11 +5761,8 @@ do
         local ModeButtons = {}
         local TotalModeButtons = GetTableSize(Info.Modes)
         local MenuTable = Library:AddContextMenu(Picker, UDim2.fromOffset(62, 0), function()
-            return { Picker.AbsoluteSize.X + 1.5, 0.5 }
-        end, 1, function(Active: boolean)
-            PickerCorner.TopRightRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-            PickerCorner.BottomRightRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-        end, false, if TotalModeButtons == 1 then "no_left" else "no_top_left", "KeyPicker")
+            return { Picker.AbsoluteSize.X + Library:GetMenuGap() * Library.DPIScale, 0.5 }
+        end, 1, nil, false, nil, "KeyPicker")
         KeyPicker.Menu = MenuTable
 
         for Index, Mode in Info.Modes do
@@ -5048,12 +6475,9 @@ do
             Holder,
             UDim2.fromOffset(Info.Transparency and 256 or 234, 0),
             function()
-                return { 0.5, Holder.AbsoluteSize.Y + 1.5 }
+                return { 0.5, Holder.AbsoluteSize.Y + Library:GetMenuGap() * Library.DPIScale }
             end,
-            1, function(Active: boolean)
-                ColorPickerCorner.BottomRightRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-                ColorPickerCorner.BottomLeftRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-            end, false, "no_top_left")
+            1, nil, false, nil)
         ColorMenu.List.Padding = UDim.new(0, 0)
         ColorPicker.ColorMenu = ColorMenu
 
@@ -5409,13 +6833,13 @@ do
             })
         )
 
+        Library:SmoothTextBox(HueBox)
+        Library:SmoothTextBox(RgbBox)
+
         --// Context Menu \\--
         local ContextMenu = Library:AddContextMenu(Holder, UDim2.fromOffset(93, 0), function()
-            return { Holder.AbsoluteSize.X + 1.5, 0.5 }
-        end, 1, function(Active: boolean)
-            ColorPickerCorner.TopRightRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-            ColorPickerCorner.BottomRightRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-        end, false, "no_top_left")
+            return { Holder.AbsoluteSize.X + Library:GetMenuGap() * Library.DPIScale, 0.5 }
+        end, 1, nil, false, nil)
         ColorPicker.ContextMenu = ContextMenu
         ContextMenu.List.Padding = UDim.new(0, 6)
         do
@@ -7137,6 +8561,8 @@ do
             })
         )
 
+        Library:SmoothTextBox(Box)
+
         -- la taille du texte reste fixe (14) : la zone de texte passe a la ligne et grandit en hauteur,
         -- et le groupbox grandit avec elle
         local BoxMinHeight = 21
@@ -7502,6 +8928,7 @@ do
                 LineJoinMode = Enum.LineJoinMode.Miter,
                 Parent = InputTextBox,
             })
+            Library:SmoothTextBox(InputTextBox)
         end
 
         local Fill = New("Frame", {
@@ -7939,12 +9366,22 @@ do
 
         -- marge verticale du menu : sans ca la 1ere/derniere ligne (et sa surbrillance) deborde des coins arrondis du menu
         local MenuPad = 4
+        local RowInset = 4
 
         -- le texte et la fleche s'ecartent des coins quand le rayon augmente (sinon ils collent a la courbe)
         local function ApplyRadiusLayout()
             local Extra = math.max(0, math.floor(Library.CornerRadius / 2) - 4)
             DisplayPadding.PaddingLeft = UDim.new(0, 8 + Extra)
             DisplayPadding.PaddingRight = UDim.new(0, 4 + Extra)
+
+            -- marges internes du menu : la 1ere/derniere ligne reste a l'interieur de la courbe quel que soit le rayon
+            MenuPad = 4 + math.floor(Library.CornerRadius / 4)
+            RowInset = 4 + math.floor(Library.CornerRadius / 4)
+
+            if Dropdown.RecalculateListSize and Dropdown.RefreshPool then
+                Dropdown:RecalculateListSize()
+                Dropdown:RefreshPool()
+            end
         end
         ApplyRadiusLayout()
         Library.CornerRadiusListeners[Dropdown] = ApplyRadiusLayout
@@ -8006,6 +9443,7 @@ do
                 PaddingLeft = UDim.new(0, 8),
                 Parent = SearchBox,
             })
+            Library:SmoothTextBox(SearchBox)
         end
 
         local GetValueImage = function(Value, RawValue)
@@ -8042,10 +9480,13 @@ do
         local MenuTable = Library:AddContextMenu(
             DisplayContainer,
             function()
-                return UDim2.fromOffset((DisplayContainer.AbsoluteSize.X / Library.DPIScale), 0)
+                return UDim2.fromOffset((DisplayContainer.AbsoluteSize.X / Library.DPIScale) - Library:GetMenuInset() * 2, 0)
             end,
             function()
-                return { 0.5, DisplayContainer.AbsoluteSize.Y + 1.5 }
+                return {
+                    0.5 + Library:GetMenuInset() * Library.DPIScale,
+                    DisplayContainer.AbsoluteSize.Y + Library:GetMenuGap() * Library.DPIScale,
+                }
             end,
             2,
             function(Active: boolean)
@@ -8058,12 +9499,9 @@ do
                     SearchBox.Text = ""
                     SearchBox.Visible = Active
                 end
-
-                DropdownCorner.BottomRightRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
-                DropdownCorner.BottomLeftRadius = Active and UDim.new(0, 0) or UDim.new(0, Library.CornerRadius / 2)
             end,
             false,
-            "bottom",
+            nil, -- coins arrondis sur les 4 angles : le menu "flotte" sous le bouton au lieu d'etre colle dessus
             "Dropdown"
         )
         Dropdown.Menu = MenuTable
@@ -8081,7 +9519,7 @@ do
             MenuTable.Menu.CanvasSize = UDim2.fromOffset(0, ItemCount * ItemHeight + Pad)
 
             MenuTable:SetSize(function()
-                return UDim2.fromOffset((DisplayContainer.AbsoluteSize.X / Library.DPIScale), Y)
+                return UDim2.fromOffset((DisplayContainer.AbsoluteSize.X / Library.DPIScale) - Library:GetMenuInset() * 2, Y)
             end)
         end
 
@@ -8267,7 +9705,8 @@ do
                 end
 
                 Row.Container.Visible = true
-                Row.Container.Position = UDim2.fromOffset(4, MenuPad + (DataIndex - 1) * ItemHeight)
+                Row.Container.Size = UDim2.new(1, -RowInset * 2, 0, ItemHeight)
+                Row.Container.Position = UDim2.fromOffset(RowInset, MenuPad + (DataIndex - 1) * ItemHeight)
 
                 Row.Button.Text = Entry.FormattedValue
 
@@ -10611,6 +12050,69 @@ function Library:CreateWindow(WindowInfo)
             Parent = CurrentTabInfo,
         })
 
+        --// Bouton menu (3 barres dans un rond) a gauche de la barre de recherche \\--
+        do
+            local MenuButton = New("TextButton", {
+                BackgroundColor3 = "MainColor",
+                Size = UDim2.fromScale(1, 1),
+                SizeConstraint = Enum.SizeConstraint.RelativeYY, -- carre (largeur = hauteur) => rond avec le UICorner
+                Text = "",
+                Visible = not (WindowInfo.DisableSearch or WindowInfo.DisableMenuButton or false),
+                Parent = RightWrapper,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(1, 0),
+                Parent = MenuButton,
+            })
+            New("UIStroke", {
+                Color = "OutlineColor",
+                Parent = MenuButton,
+            })
+
+            local Bars = New("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                BackgroundTransparency = 1,
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(14, 12),
+                Parent = MenuButton,
+            })
+            New("UIListLayout", {
+                FillDirection = Enum.FillDirection.Vertical,
+                HorizontalAlignment = Enum.HorizontalAlignment.Center,
+                VerticalAlignment = Enum.VerticalAlignment.Center,
+                Padding = UDim.new(0, 3),
+                Parent = Bars,
+            })
+            for _ = 1, 3 do
+                local Bar = New("Frame", {
+                    BackgroundColor3 = "FontColor",
+                    BackgroundTransparency = 0.25,
+                    Size = UDim2.fromOffset(14, 2),
+                    Parent = Bars,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(1, 0),
+                    Parent = Bar,
+                })
+            end
+
+            MenuButton.MouseEnter:Connect(function()
+                TweenService:Create(MenuButton, Library.TweenInfo, {
+                    BackgroundColor3 = Library:GetLighterColor(Library.Scheme.MainColor),
+                }):Play()
+            end)
+            MenuButton.MouseLeave:Connect(function()
+                TweenService:Create(MenuButton, Library.TweenInfo, {
+                    BackgroundColor3 = Library.Scheme.MainColor,
+                }):Play()
+            end)
+
+            -- clic : masque tous les blocs de l'onglet un par un (re-clic : les reaffiche un par un)
+            MenuButton.MouseButton1Click:Connect(function()
+                Library:ToggleBlocks()
+            end)
+        end
+
         SearchBox = New("TextBox", {
             BackgroundColor3 = "MainColor",
             PlaceholderText = "Search",
@@ -10641,6 +12143,7 @@ function Library:CreateWindow(WindowInfo)
             Color = "OutlineColor",
             Parent = SearchBox,
         })
+        Library:SmoothTextBox(SearchBox)
 
         local SearchIcon = Library:GetIcon("search")
         if SearchIcon then
@@ -12463,6 +13966,8 @@ function Library:CreateWindow(WindowInfo)
                     Parent = Box,
                 })
             )
+
+            Library:SmoothTextBox(Box)
 
             local Button = New("TextButton", {
                 AnchorPoint = Vector2.new(1, 0),
