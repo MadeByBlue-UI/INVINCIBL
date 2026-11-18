@@ -427,7 +427,7 @@ local Templates = {
     },
     Loading = {
         Title = "mspaint",
-        Icon = 95816097006870,
+        Icon = "galaxy",
         IconSize = UDim2.fromOffset(30, 30),
 
         LoadingIcon = CustomImageManager.GetAsset("LoadingIcon"),
@@ -7144,12 +7144,44 @@ do
         local BoxLabelSpace = 18 -- Holder = Label + espace + Box (39 - 21)
         local LastBoxHeight = BoxMinHeight
 
+        -- hauteur du texte mesuree avec TextService (fiable meme quand Box.TextBounds ne se met pas a jour)
+        local function MeasureTextHeight(): number?
+            local Width = (Box.AbsoluteSize.X / Library.DPIScale) - 16 -- PaddingLeft (8) + PaddingRight (8)
+            if Width <= 0 then
+                return nil -- onglet cache : on remesurera des qu'il sera affiche (signal AbsoluteSize)
+            end
+
+            local Params = Instance.new("GetTextBoundsParams")
+            -- le point garde la derniere ligne comptee quand le texte finit par un retour a la ligne
+            Params.Text = Box.Text .. "."
+            Params.RichText = false
+            Params.Font = Box.FontFace
+            Params.Size = Box.TextSize
+            Params.Width = Width
+
+            local Success, Bounds = pcall(TextService.GetTextBoundsAsync, TextService, Params)
+            if Success then
+                return Bounds.Y
+            end
+
+            return Box.TextBounds.Y / Library.DPIScale
+        end
+
+        local FitToken = 0
         local function FitBox()
             if Input.Destroyed or not Box.Parent then
                 return
             end
 
-            local Needed = math.max(BoxMinHeight, math.ceil(Box.TextBounds.Y / Library.DPIScale) + BoxVerticalPadding)
+            FitToken += 1
+            local Token = FitToken
+
+            local TextHeight = MeasureTextHeight()
+            if not TextHeight or Token ~= FitToken or Input.Destroyed or not Box.Parent then
+                return
+            end
+
+            local Needed = math.max(BoxMinHeight, math.ceil(TextHeight) + BoxVerticalPadding)
             if Info.MaxHeight then
                 Needed = math.min(Needed, Info.MaxHeight)
             end
@@ -7169,6 +7201,7 @@ do
             end)
         end
 
+        table.insert(Input.Connections, Box:GetPropertyChangedSignal("Text"):Connect(FitBox))
         table.insert(Input.Connections, Box:GetPropertyChangedSignal("TextBounds"):Connect(FitBox))
         table.insert(Input.Connections, Box:GetPropertyChangedSignal("AbsoluteSize"):Connect(FitBox))
         task.defer(FitBox)
