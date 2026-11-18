@@ -206,6 +206,8 @@ local Library = {
     --// Corners \\--
     Corners = {},
     SpecificCorners = {},
+    -- callbacks appeles quand le Corner Radius change (pour les elements dont la mise en page depend du rayon : dropdown, ...)
+    CornerRadiusListeners = {},
 
     --// Animations \\--
     TweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
@@ -7855,7 +7857,7 @@ do
             Parent = Holder,
         })
 
-        New("UIPadding", {
+        local DisplayPadding = New("UIPadding", {
             PaddingLeft = UDim.new(0, 8),
             PaddingRight = UDim.new(0, 4),
             Parent = DisplayContainer,
@@ -7865,6 +7867,18 @@ do
             Color = "OutlineColor",
             Parent = DisplayContainer,
         })
+
+        -- marge verticale du menu : sans ca la 1ere/derniere ligne (et sa surbrillance) deborde des coins arrondis du menu
+        local MenuPad = 4
+
+        -- le texte et la fleche s'ecartent des coins quand le rayon augmente (sinon ils collent a la courbe)
+        local function ApplyRadiusLayout()
+            local Extra = math.max(0, math.floor(Library.CornerRadius / 2) - 4)
+            DisplayPadding.PaddingLeft = UDim.new(0, 8 + Extra)
+            DisplayPadding.PaddingRight = UDim.new(0, 4 + Extra)
+        end
+        ApplyRadiusLayout()
+        Library.CornerRadiusListeners[Dropdown] = ApplyRadiusLayout
 
         local DropdownCorner = New("UICorner", {
             TopLeftRadius = UDim.new(0, Library.CornerRadius / 2),
@@ -7992,9 +8006,10 @@ do
 
         function Dropdown:RecalculateListSize(Count)
             local ItemCount = Count or #FilteredEntries
-            local Y = math.clamp(ItemCount * ItemHeight, 0, Info.MaxVisibleDropdownItems * ItemHeight)
+            local Pad = ItemCount > 0 and (MenuPad * 2) or 0
+            local Y = math.clamp(ItemCount * ItemHeight, 0, Info.MaxVisibleDropdownItems * ItemHeight) + Pad
 
-            MenuTable.Menu.CanvasSize = UDim2.fromOffset(0, ItemCount * ItemHeight)
+            MenuTable.Menu.CanvasSize = UDim2.fromOffset(0, ItemCount * ItemHeight + Pad)
 
             MenuTable:SetSize(function()
                 return UDim2.fromOffset((DisplayContainer.AbsoluteSize.X / Library.DPIScale), Y)
@@ -8162,7 +8177,7 @@ do
 
             local MaxFirst = Total - PoolSize + 1
             local ScrollY = MenuTable.Menu.CanvasPosition.Y / Library.DPIScale
-            local Index = math.floor(ScrollY / ItemHeight) + 1
+            local Index = math.floor(math.max(ScrollY - MenuPad, 0) / ItemHeight) + 1
             return math.clamp(Index, 1, MaxFirst)
         end
 
@@ -8183,11 +8198,7 @@ do
                 end
 
                 Row.Container.Visible = true
-                Row.Container.Position = UDim2.fromOffset(0, (DataIndex - 1) * ItemHeight)
-
-                local IsLast = DataIndex == Total
-                Row.Corner.BottomRightRadius = IsLast and UDim.new(0, Library.CornerRadius / 2) or UDim.new(0, 0)
-                Row.Corner.BottomLeftRadius = IsLast and UDim.new(0, Library.CornerRadius / 2) or UDim.new(0, 0)
+                Row.Container.Position = UDim2.fromOffset(4, MenuPad + (DataIndex - 1) * ItemHeight)
 
                 Row.Button.Text = Entry.FormattedValue
 
@@ -8307,19 +8318,20 @@ do
                 Index = nil
             }
 
+            -- ligne en retrait de 4 px de chaque cote et coins arrondis : la surbrillance ne colle plus aux bords arrondis du menu
             local Container = New("Frame", {
                 BackgroundColor3 = "MainColor",
                 BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, ItemHeight),
+                Size = UDim2.new(1, -8, 0, ItemHeight),
                 Visible = false,
                 Parent = MenuTable.Menu,
             })
 
             local Corner = New("UICorner", {
-                TopLeftRadius = UDim.new(0, 0),
-                TopRightRadius = UDim.new(0, 0),
-                BottomRightRadius = UDim.new(0, 0),
-                BottomLeftRadius = UDim.new(0, 0),
+                TopLeftRadius = UDim.new(0, Library.CornerRadius / 2),
+                TopRightRadius = UDim.new(0, Library.CornerRadius / 2),
+                BottomRightRadius = UDim.new(0, Library.CornerRadius / 2),
+                BottomLeftRadius = UDim.new(0, Library.CornerRadius / 2),
                 Parent = Container,
             }); table.insert(Library.SpecificCorners, Corner)
 
@@ -8806,6 +8818,8 @@ do
 
         function Dropdown:Destroy()
             Dropdown.Destroyed = true
+
+            Library.CornerRadiusListeners[Dropdown] = nil
 
             StopDragSelect()
 
@@ -9932,6 +9946,7 @@ function Library:Notify(...)
         Data.Icon = Info.Icon
         Data.BigIcon = Info.BigIcon
         Data.IconColor = Info.IconColor
+        Data.IconBackground = Info.IconBackground
 
         Data.Volume = tonumber(Info.Volume) or 3
     else
@@ -9970,10 +9985,11 @@ function Library:Notify(...)
         ZIndex = 5,
         Parent = FakeBackground,
     })
+    -- demi-rayon : avec le rayon plein (jusqu'a 20) le texte, l'icone et la barre de temps depassaient des coins
     table.insert(
         Library.Corners,
         New("UICorner", {
-            CornerRadius = UDim.new(0, Library.CornerRadius),
+            CornerRadius = UDim.new(0, Library.CornerRadius / 2),
             Parent = Holder,
         })
     )
@@ -10007,17 +10023,43 @@ function Library:Notify(...)
     end
 
     local BigIconLabel
+    local BigIconBadgeSize = 40
     if Data.BigIcon then
         local ParsedIcon = Library:GetCustomIcon(Data.BigIcon)
         if ParsedIcon then
-            BigIconLabel = New("ImageLabel", {
+            -- pastille pleine derriere l'icone (couleur d'accent par defaut) : l'image garde ses couleurs d'origine
+            -- et reste lisible meme si elle est sombre. IconBackground permet de changer la couleur de la pastille.
+            BigIconLabel = New("Frame", {
+                BackgroundColor3 = Data.IconBackground or "AccentColor",
+                BackgroundTransparency = 0,
+                Size = UDim2.fromOffset(BigIconBadgeSize, BigIconBadgeSize),
+                Parent = ContentContainer,
+            })
+            -- demi-rayon, comme le reste des petits elements (sinon la pastille devient un cercle au rayon max)
+            table.insert(
+                Library.Corners,
+                New("UICorner", {
+                    CornerRadius = UDim.new(0, Library.CornerRadius / 2),
+                    Parent = BigIconLabel,
+                })
+            )
+            New("UIStroke", {
+                Color = "OutlineColor",
+                Thickness = 1,
+                Parent = BigIconLabel,
+            })
+            New("ImageLabel", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
                 BackgroundTransparency = 1,
-                Size = UDim2.fromOffset(24, 24),
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(28, 28),
+                ScaleType = Enum.ScaleType.Fit,
                 Image = ParsedIcon.Url,
-                ImageColor3 = Data.IconColor or "AccentColor",
+                -- pas de teinte par defaut : IconColor seulement si on la demande explicitement
+                ImageColor3 = Data.IconColor or Color3.new(1, 1, 1),
                 ImageRectOffset = ParsedIcon.ImageRectOffset,
                 ImageRectSize = ParsedIcon.ImageRectSize,
-                Parent = ContentContainer,
+                Parent = BigIconLabel,
             })
         end
     end
@@ -10099,7 +10141,7 @@ function Library:Notify(...)
     end
 
     function Data:Resize()
-        local ExtraWidth = BigIconLabel and 32 or 0
+        local ExtraWidth = BigIconLabel and (BigIconBadgeSize + 8) or 0
         local IconWidth = IconLabel and 21 or 0
 
         if Title then
@@ -10798,29 +10840,60 @@ function Library:CreateWindow(WindowInfo)
 
     function Window:SetCornerRadius(Radius: number)
         assert(typeof(Radius) == "number", "Expected number for Radius got: " .. typeof(Radius))
-        Radius = math.min(Radius, 20)
+        Radius = math.clamp(Radius, 0, 20)
 
-        local RadiusHalf = UDim.new(0, Radius / 2)
-        local RadiusUDim = UDim.new(0, Radius)
-        local HalfCurrent = Library.CornerRadius / 2
+        local OldRadius = Library.CornerRadius
+
+        -- chaque coin garde son "ratio" (1 = rayon plein, 0.5 = demi-rayon...) memorise la 1ere fois qu'on le voit :
+        -- plus de devinette "== moitie de l'ancien rayon", ca marche aussi quand on passe par 0
+        local function Ratio(UICorner: UICorner, Key: string, Offset: number): number?
+            local AttrName = "CRRatio_" .. Key
+            local Mul = UICorner:GetAttribute(AttrName)
+
+            if Mul == nil then
+                if Offset == 0 then
+                    return nil
+                end
+
+                Mul = OldRadius > 0 and (Offset / OldRadius) or 0.5
+                UICorner:SetAttribute(AttrName, Mul)
+            end
+
+            return Mul
+        end
 
         for _, UICorner in Library.Corners do
-            if UICorner.CornerRadius.Offset == HalfCurrent then
-                UICorner.CornerRadius = RadiusHalf
-            else
-                UICorner.CornerRadius = RadiusUDim
+            local Current = UICorner.CornerRadius
+
+            if Current.Scale == 0 then
+                local Mul = Ratio(UICorner, "All", Current.Offset)
+
+                if Mul then
+                    UICorner.CornerRadius = UDim.new(0, Radius * Mul)
+                end
             end
         end
 
         for _, UICorner in Library.SpecificCorners do
-            SetUICorner(UICorner, "TopRightRadius", HalfCurrent, RadiusHalf, RadiusUDim)
-            SetUICorner(UICorner, "TopLeftRadius", HalfCurrent, RadiusHalf, RadiusUDim)
-            SetUICorner(UICorner, "BottomRightRadius", HalfCurrent, RadiusHalf, RadiusUDim)
-            SetUICorner(UICorner, "BottomLeftRadius", HalfCurrent, RadiusHalf, RadiusUDim)
+            for _, Key in { "TopLeftRadius", "TopRightRadius", "BottomRightRadius", "BottomLeftRadius" } do
+                local Current = UICorner[Key]
+
+                if Current.Scale == 0 then
+                    local Mul = Ratio(UICorner, Key, Current.Offset)
+
+                    if Mul then
+                        UICorner[Key] = UDim.new(0, Radius * Mul)
+                    end
+                end
+            end
         end
 
         Library.CornerRadius = Radius
         WindowInfo.CornerRadius = Radius
+
+        for _, Listener in Library.CornerRadiusListeners do
+            task.spawn(Listener, Radius)
+        end
 
         ResizeButton.Position = UDim2.new(1, -Radius / 4, 0, 0)
         BottomBackground.Size = UDim2.new(1, 0, 0, 20 + Radius)
@@ -14048,6 +14121,7 @@ function Library:Unload()
 
     table.clear(Library.Corners)
     table.clear(Library.SpecificCorners)
+    table.clear(Library.CornerRadiusListeners)
 
     table.clear(Library.Notifications)
     table.clear(Library.Dialogues)
