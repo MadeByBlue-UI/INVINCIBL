@@ -7100,11 +7100,11 @@ do
         })
 
         local Box = New("TextBox", {
-            AnchorPoint = Vector2.new(0, 1),
+            AnchorPoint = Vector2.zero,
             BackgroundColor3 = "MainColor",
             ClearTextOnFocus = not Input.Disabled and Input.ClearTextOnFocus,
             PlaceholderText = Input.Placeholder,
-            Position = UDim2.fromScale(0, 1),
+            Position = UDim2.fromOffset(0, 18), -- sous le label (ancree en haut : la boite grandit vers le bas)
             Size = UDim2.new(1, 0, 0, 21),
             Text = Input.Value,
             TextEditable = not Input.Disabled,
@@ -7168,6 +7168,10 @@ do
         end
 
         local FitToken = 0
+        local FirstFit = true
+        local BoxTween, HolderTween
+        local FitTweenInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
         local function FitBox()
             if Input.Destroyed or not Box.Parent then
                 return
@@ -7186,24 +7190,56 @@ do
                 Needed = math.min(Needed, Info.MaxHeight)
             end
 
+            local Snap = FirstFit
+            FirstFit = false
+
             if Needed == LastBoxHeight then
                 return
             end
             LastBoxHeight = Needed
 
-            Box.Size = UDim2.new(1, 0, 0, Needed)
-            Holder.Size = UDim2.new(1, 0, 0, Needed + BoxLabelSpace)
-            Groupbox:Resize()
-            task.defer(function()
+            local BoxSize = UDim2.new(1, 0, 0, Needed)
+            local HolderSize = UDim2.new(1, 0, 0, Needed + BoxLabelSpace)
+
+            if BoxTween then BoxTween:Cancel() end
+            if HolderTween then HolderTween:Cancel() end
+
+            -- 1er calcul (creation) : pas d'animation. Ensuite la boite, son conteneur et le groupbox grandissent en douceur
+            if Snap then
+                Box.Size = BoxSize
+                Holder.Size = HolderSize
+                Groupbox:Resize()
+                return
+            end
+
+            BoxTween = TweenService:Create(Box, FitTweenInfo, { Size = BoxSize })
+            HolderTween = TweenService:Create(Holder, FitTweenInfo, { Size = HolderSize })
+            BoxTween:Play()
+            HolderTween:Play()
+
+            BoxTween.Completed:Once(function()
                 if not Input.Destroyed then
                     Groupbox:Resize()
                 end
             end)
         end
 
+        -- le groupbox suit la hauteur du conteneur image par image pendant l'animation
+        table.insert(Input.Connections, Holder:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            if not Input.Destroyed then
+                Groupbox:Resize()
+            end
+        end))
+
         table.insert(Input.Connections, Box:GetPropertyChangedSignal("Text"):Connect(FitBox))
-        table.insert(Input.Connections, Box:GetPropertyChangedSignal("TextBounds"):Connect(FitBox))
-        table.insert(Input.Connections, Box:GetPropertyChangedSignal("AbsoluteSize"):Connect(FitBox))
+        -- seule la largeur change le nombre de lignes : on ignore les changements de hauteur (sinon recalcul a chaque image de l'animation)
+        local LastBoxWidth = Box.AbsoluteSize.X
+        table.insert(Input.Connections, Box:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            if Box.AbsoluteSize.X ~= LastBoxWidth then
+                LastBoxWidth = Box.AbsoluteSize.X
+                FitBox()
+            end
+        end))
         task.defer(FitBox)
 
         function Input:UpdateColors()
