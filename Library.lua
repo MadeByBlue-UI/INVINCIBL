@@ -2905,6 +2905,9 @@ do
         end)
 
         Box:GetPropertyChangedSignal("PlaceholderText"):Connect(function()
+            if S.Broken then
+                return
+            end
             if Box.PlaceholderText ~= "" then
                 S.PlaceholderStore = Box.PlaceholderText
                 Placeholder.Text = Box.PlaceholderText
@@ -2913,6 +2916,9 @@ do
         end)
 
         Box:GetPropertyChangedSignal("TextTransparency"):Connect(function()
+            if S.Broken then
+                return
+            end
             local Value = Box.TextTransparency
             if Value ~= 1 then
                 S.BaseT = Value
@@ -2973,7 +2979,7 @@ do
         -- boite cachee puis reaffichee (ex : barre de recherche d'un dropdown) : on remesure tout et on remet
         -- le placeholder / la selection, sinon ils restent invisibles tant que la mise en page n'a pas ete refaite
         local function Reveal()
-            if Box.Visible then
+            if Box.Visible and not S.Broken then
                 S.PhDirty = true
                 S.CaretDirty = true
                 S.SelV = -1
@@ -9461,6 +9467,9 @@ do
             if Dropdown.RecalculateListSize and Dropdown.RefreshPool then
                 Dropdown:RecalculateListSize()
                 Dropdown:RefreshPool()
+                if Dropdown.Remeasure then
+                    Dropdown:Remeasure()
+                end
             end
         end
         ApplyRadiusLayout()
@@ -9523,7 +9532,7 @@ do
                 PaddingLeft = UDim.new(0, 8),
                 Parent = SearchBox,
             })
-            Library:SmoothTextBox(SearchBox)
+            -- TextBox natif ici (pas de Smooth Text) : "Search..." et le bleu de selection s'affichent toujours
         end
 
         local GetValueImage = function(Value, RawValue)
@@ -9570,6 +9579,10 @@ do
             end,
             2,
             function(Active: boolean)
+                if Active and Dropdown.Remeasure then
+                    Dropdown:Remeasure()
+                end
+
                 DisplayButton.TextTransparency = (Active and SearchBox) and 1 or 0
 
                 ArrowImage.ImageTransparency = Active and 0 or 0.5
@@ -9591,15 +9604,113 @@ do
         local Pool = {}
         local FilteredEntries = {}
 
+        --// Lignes a hauteur variable : un texte trop long passe sur une 2eme ligne (etc.) et la ligne grandit \\--
+        local HeightCache = {}
+        local MeasureToken = 0
+        local ResizeTween
+        local UpdateScrollBar = function() end
+
+        local function GetAvailWidth(Entry)
+            local MenuW = (DisplayContainer.AbsoluteSize.X / Library.DPIScale) - Library:GetMenuInset() * 2
+            return MenuW - RowInset * 2 - 14 - (Entry.ValueImage and 18 or 0)
+        end
+
+        local function NeedsMeasure(Entry, Width)
+            return Width > 24 and #Entry.FormattedValue * 10 > Width
+        end
+
+        local function HeightKey(Entry, Width)
+            return Entry.FormattedValue .. "|" .. tostring(math.floor(Width))
+        end
+
+        local function LayoutEntries()
+            local Top = 0
+            for _, Entry in FilteredEntries do
+                local Height = ItemHeight
+                local Width = GetAvailWidth(Entry)
+                if NeedsMeasure(Entry, Width) then
+                    Height = HeightCache[HeightKey(Entry, Width)] or ItemHeight
+                end
+
+                Entry.H = Height
+                Entry.Top = Top
+                Top += Height
+            end
+
+            return Top
+        end
+
         function Dropdown:RecalculateListSize(Count)
-            local ItemCount = Count or #FilteredEntries
-            local Pad = ItemCount > 0 and (MenuPad * 2) or 0
-            local Y = math.clamp(ItemCount * ItemHeight, 0, Info.MaxVisibleDropdownItems * ItemHeight) + Pad
+            local Content = LayoutEntries()
+            local Pad = #FilteredEntries > 0 and (MenuPad * 2) or 0
+            local Y = math.clamp(Content, 0, Info.MaxVisibleDropdownItems * ItemHeight) + Pad
 
-            MenuTable.Menu.CanvasSize = UDim2.fromOffset(0, ItemCount * ItemHeight + Pad)
+            MenuTable.Menu.CanvasSize = UDim2.fromOffset(0, Content + Pad)
 
-            MenuTable:SetSize(function()
+            local function SizeFunc()
                 return UDim2.fromOffset((DisplayContainer.AbsoluteSize.X / Library.DPIScale) - Library:GetMenuInset() * 2, Y)
+            end
+            MenuTable.Size = SizeFunc
+
+            local function Apply()
+                local Target = SizeFunc()
+                if ResizeTween then
+                    ResizeTween:Cancel()
+                    ResizeTween = nil
+                end
+
+                -- la boite s'agrandit / se reduit en douceur quand le contenu change (recherche, ligne qui passe sur 2 lignes...)
+                if MenuTable.Active and Library.Animations and Library.Animations.Dropdown == true then
+                    ResizeTween = TweenService:Create(MenuTable.Menu, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = Target })
+                    ResizeTween:Play()
+                else
+                    MenuTable.Menu.Size = Target
+                end
+            end
+
+            if MenuTable.OpenCloseTween then
+                -- animation d'ouverture en cours : on attend sa fin pour ne pas se battre avec elle
+                task.delay(Library.DropdownTransitionInfo.Time + 0.02, function()
+                    if not Dropdown.Destroyed and MenuTable.Active and not MenuTable.OpenCloseTween then
+                        Apply()
+                    end
+                end)
+            else
+                Apply()
+            end
+
+            UpdateScrollBar()
+        end
+
+        -- mesure (asynchrone) des textes trop longs ; quand c'est fini, la liste se remet en page toute seule
+        function Dropdown:Remeasure()
+            MeasureToken += 1
+            local Token = MeasureToken
+
+            task.spawn(function()
+                local Font = Pool[1] and Pool[1].Button.FontFace or Library.Scheme.Font
+                local Changed = false
+
+                for _, Entry in table.clone(FilteredEntries) do
+                    if Token ~= MeasureToken or Dropdown.Destroyed or Library.Unloaded then
+                        return
+                    end
+
+                    local Width = GetAvailWidth(Entry)
+                    if NeedsMeasure(Entry, Width) then
+                        local Key = HeightKey(Entry, Width)
+                        if HeightCache[Key] == nil then
+                            local Ok, _, Y = pcall(Library.GetTextBounds, Library, Entry.FormattedValue, Font, 14, Width)
+                            HeightCache[Key] = (Ok and typeof(Y) == "number") and math.max(ItemHeight, math.ceil(Y) + 7) or ItemHeight
+                            Changed = true
+                        end
+                    end
+                end
+
+                if Changed and Token == MeasureToken and not Dropdown.Destroyed then
+                    Dropdown:RecalculateListSize()
+                    Dropdown:RefreshPool()
+                end
             end)
         end
 
@@ -9763,9 +9874,24 @@ do
             end
 
             local MaxFirst = Total - PoolSize + 1
-            local ScrollY = MenuTable.Menu.CanvasPosition.Y / Library.DPIScale
-            local Index = math.floor(math.max(ScrollY - MenuPad, 0) / ItemHeight) + 1
-            return math.clamp(Index, 1, MaxFirst)
+            local ScrollY = math.max(MenuTable.Menu.CanvasPosition.Y / Library.DPIScale - MenuPad, 0)
+
+            if not FilteredEntries[Total].Top then
+                LayoutEntries()
+            end
+
+            local Low, High = 1, Total
+            while Low < High do
+                local Mid = (Low + High) // 2
+                local Entry = FilteredEntries[Mid]
+                if Entry.Top + Entry.H > ScrollY then
+                    High = Mid
+                else
+                    Low = Mid + 1
+                end
+            end
+
+            return math.clamp(Low, 1, MaxFirst)
         end
 
         function Dropdown:RefreshPool()
@@ -9785,8 +9911,15 @@ do
                 end
 
                 Row.Container.Visible = true
-                Row.Container.Size = UDim2.new(1, -RowInset * 2, 0, ItemHeight)
-                Row.Container.Position = UDim2.fromOffset(RowInset, MenuPad + (DataIndex - 1) * ItemHeight)
+                if not Entry.Top then
+                    LayoutEntries()
+                end
+                local RowH = Entry.H or ItemHeight
+
+                Row.Container.Size = UDim2.new(1, -RowInset * 2, 0, RowH)
+                Row.Container.Position = UDim2.fromOffset(RowInset, MenuPad + Entry.Top)
+                -- 1 ligne : "..." si ca deborde (le temps que la mesure finisse) ; plusieurs lignes : texte complet
+                Row.Button.TextTruncate = RowH <= ItemHeight and Enum.TextTruncate.AtEnd or Enum.TextTruncate.None
 
                 Row.Button.Text = Entry.FormattedValue
 
@@ -9795,11 +9928,11 @@ do
                     Row.Image.Image = Entry.ValueImage.Url
                     Row.Image.ImageRectOffset = Entry.ValueImage.ImageRectOffset or Vector2.zero
                     Row.Image.ImageRectSize = Entry.ValueImage.ImageRectSize or Vector2.zero
-                    Row.Button.Size = UDim2.new(1, -18, 0, ItemHeight)
+                    Row.Button.Size = UDim2.new(1, -18, 0, RowH)
                     Row.Button.Position = UDim2.fromOffset(18, 0)
                 else
                     Row.Image.Visible = false
-                    Row.Button.Size = UDim2.new(1, 0, 0, ItemHeight)
+                    Row.Button.Size = UDim2.new(1, 0, 0, RowH)
                     Row.Button.Position = UDim2.fromOffset(0, 0)
                 end
 
@@ -9939,6 +10072,7 @@ do
                 Text = "",
                 TextSize = 14,
                 TextTransparency = 0.5,
+                TextWrapped = true,
                 TextXAlignment = Enum.TextXAlignment.Left,
                 Parent = Container,
             })
@@ -10125,8 +10259,9 @@ do
 
             MenuTable.Menu.CanvasPosition = Vector2.new(0, 0)
 
-            Dropdown:RefreshPool()
             Dropdown:RecalculateListSize(#FilteredEntries)
+            Dropdown:RefreshPool()
+            Dropdown:Remeasure()
         end
 
         for _ = 1, PoolSize do
@@ -10135,6 +10270,54 @@ do
 
         table.insert(Dropdown.Connections, MenuTable.Menu:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
             Dropdown:RefreshPool()
+        end))
+
+        --// Scrollbar maison : la native depasse des coins arrondis du menu. Celle-ci reste dans le menu, avec la meme marge que les lignes \\--
+        do
+            local Menu = MenuTable.Menu
+            Menu.ScrollBarThickness = 0
+
+            local Bar = New("Frame", {
+                BackgroundColor3 = "OutlineColor",
+                Size = UDim2.fromOffset(2, 12),
+                Visible = false,
+                ZIndex = Menu.ZIndex + 2,
+                Parent = Menu,
+            })
+            New("UICorner", {
+                CornerRadius = UDim.new(1, 0),
+                Parent = Bar,
+            })
+
+            UpdateScrollBar = function()
+                local ViewH = Menu.AbsoluteWindowSize.Y / Library.DPIScale
+                local CanvasH = Menu.CanvasSize.Y.Offset
+
+                if CanvasH <= ViewH + 0.5 or ViewH <= 0 then
+                    Bar.Visible = false
+                    return
+                end
+
+                local ScrollY = Menu.CanvasPosition.Y / Library.DPIScale
+                local TrackH = math.max(ViewH - MenuPad * 2, 1)
+                local ThumbH = math.clamp(TrackH * ViewH / CanvasH, 12, TrackH)
+                local MaxScroll = math.max(CanvasH - ViewH, 1)
+                local Frac = math.clamp(ScrollY / MaxScroll, 0, 1)
+
+                Bar.Size = UDim2.fromOffset(2, ThumbH)
+                Bar.Position = UDim2.new(1, -(RowInset - 1), 0, ScrollY + MenuPad + Frac * (TrackH - ThumbH))
+                Bar.Visible = true
+            end
+
+            table.insert(Dropdown.Connections, Menu:GetPropertyChangedSignal("CanvasPosition"):Connect(UpdateScrollBar))
+            table.insert(Dropdown.Connections, Menu:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(UpdateScrollBar))
+        end
+
+        -- largeur du dropdown modifiee (fenetre redimensionnee...) : les lignes sont remesurees
+        table.insert(Dropdown.Connections, DisplayContainer:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+            Dropdown:RecalculateListSize()
+            Dropdown:RefreshPool()
+            Dropdown:Remeasure()
         end))
 
         local function ValueExists(Val)
