@@ -9946,7 +9946,6 @@ function Library:Notify(...)
         Data.Icon = Info.Icon
         Data.BigIcon = Info.BigIcon
         Data.IconColor = Info.IconColor
-        Data.IconBackground = Info.IconBackground
 
         Data.Volume = tonumber(Info.Volume) or 3
     else
@@ -10023,43 +10022,20 @@ function Library:Notify(...)
     end
 
     local BigIconLabel
-    local BigIconBadgeSize = 40
+    local BigIconBadgeSize = 42 -- taille de l'icone (sert aussi a reserver la largeur dans Resize)
     if Data.BigIcon then
         local ParsedIcon = Library:GetCustomIcon(Data.BigIcon)
         if ParsedIcon then
-            -- pastille pleine derriere l'icone (couleur d'accent par defaut) : l'image garde ses couleurs d'origine
-            -- et reste lisible meme si elle est sombre. IconBackground permet de changer la couleur de la pastille.
-            BigIconLabel = New("Frame", {
-                BackgroundColor3 = Data.IconBackground or "AccentColor",
-                BackgroundTransparency = 0,
-                Size = UDim2.fromOffset(BigIconBadgeSize, BigIconBadgeSize),
-                Parent = ContentContainer,
-            })
-            -- demi-rayon, comme le reste des petits elements (sinon la pastille devient un cercle au rayon max)
-            table.insert(
-                Library.Corners,
-                New("UICorner", {
-                    CornerRadius = UDim.new(0, Library.CornerRadius / 2),
-                    Parent = BigIconLabel,
-                })
-            )
-            New("UIStroke", {
-                Color = "OutlineColor",
-                Thickness = 1,
-                Parent = BigIconLabel,
-            })
-            New("ImageLabel", {
-                AnchorPoint = Vector2.new(0.5, 0.5),
+            -- icone seule, sans fond : image a ses couleurs d'origine (IconColor seulement si on la demande)
+            BigIconLabel = New("ImageLabel", {
                 BackgroundTransparency = 1,
-                Position = UDim2.fromScale(0.5, 0.5),
-                Size = UDim2.fromOffset(28, 28),
+                Size = UDim2.fromOffset(BigIconBadgeSize, BigIconBadgeSize),
                 ScaleType = Enum.ScaleType.Fit,
                 Image = ParsedIcon.Url,
-                -- pas de teinte par defaut : IconColor seulement si on la demande explicitement
                 ImageColor3 = Data.IconColor or Color3.new(1, 1, 1),
                 ImageRectOffset = ParsedIcon.ImageRectOffset,
                 ImageRectSize = ParsedIcon.ImageRectSize,
-                Parent = BigIconLabel,
+                Parent = ContentContainer,
             })
         end
     end
